@@ -710,6 +710,83 @@ app.patch("/api/applications/:id", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// PATCH /api/profile — update MY OWN profile.
+//
+// EVERY logged-in user may call this (student, tutor, admin):
+// there is deliberately NO role check here. Only these 4
+// fields are read from the body — anything else (role, plan,
+// email ...) is ignored, so nobody can upgrade their plan or
+// change their role through this endpoint.
+// ============================================================
+app.patch("/api/profile", verifyToken, async (req, res) => {
+  try {
+    const { name, phone, bio, image } = req.body || {};
+
+    // ---------- validate ----------
+    const errors = [];
+
+    // name is the only required field
+    if (typeof name !== "string" || name.trim().length < 2) {
+      errors.push("Name must be at least 2 characters");
+    }
+
+    // phone / bio / image are optional — but must be TEXT
+    if (phone !== undefined && phone !== null && typeof phone !== "string") {
+      errors.push("Phone must be text");
+    }
+    if (bio !== undefined && bio !== null && typeof bio !== "string") {
+      errors.push("Bio must be text");
+    }
+    if (typeof bio === "string" && bio.length > 500) {
+      errors.push("Bio must be 500 characters or fewer");
+    }
+    if (image !== undefined && image !== null && typeof image !== "string") {
+      errors.push("Image must be a URL");
+    }
+    // "" simply means "no photo"; anything else must be http(s)
+    if (
+      typeof image === "string" &&
+      image !== "" &&
+      !image.startsWith("http")
+    ) {
+      errors.push("Image must be a URL starting with http");
+    }
+
+    if (errors.length > 0) {
+      return res.status(400).json({ message: errors[0], errors });
+    }
+
+    // ---------- build the update (ONLY these 4 keys!) ----------
+    const updates = {
+      name: name.trim(),
+      phone: typeof phone === "string" ? phone.trim() : "",
+      bio: typeof bio === "string" ? bio.trim() : "",
+      image: typeof image === "string" ? image.trim() : "",
+    };
+
+    // saved straight into the BetterAuth "users" collection —
+    // the navbar + drawer read these values on the next
+    // session fetch, so they update everywhere at once
+    await db
+      .collection("users")
+      .updateOne({ _id: new ObjectId(req.user.id) }, { $set: updates });
+
+    return res.json({
+      message: "Profile updated",
+      profile: {
+        ...updates,
+        email: req.user.email, // read-only info for the form
+        role: req.user.role,
+        plan: req.user.plan,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // Unknown route -> JSON 404 (not an HTML error page)
 // ============================================================
 app.use((req, res) => {

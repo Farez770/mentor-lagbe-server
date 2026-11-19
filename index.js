@@ -3,7 +3,7 @@ import "dotenv/config";
 
 import express from "express";
 import cors from "cors";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -289,9 +289,7 @@ app.get("/api/tuitions/stats", verifyToken, async (req, res) => {
 
     const postedBy = req.user.id; // the logged-in tutor
 
-    const total = await db
-      .collection("tuitions")
-      .countDocuments({ postedBy });
+    const total = await db.collection("tuitions").countDocuments({ postedBy });
 
     const approved = await db.collection("tuitions").countDocuments({
       postedBy,
@@ -309,6 +307,39 @@ app.get("/api/tuitions/stats", verifyToken, async (req, res) => {
     const applicants = 0;
 
     return res.json({ total, approved, pending, applicants });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// GET /api/tuitions/:id — ONE tuition's full details
+// (the /tuitions/[id] page loads this; no login needed)
+//
+// Route order matters: /mine and /stats are registered above,
+// so they still match before Express reaches this ":id" route.
+// ============================================================
+app.get("/api/tuitions/:id", async (req, res) => {
+  try {
+    const { id } = req.params; // the id from the URL
+    // MongoDB ids are exactly 24 hex characters — anything
+    // else cannot exist, so answer 404 without a DB lookup
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+
+    const doc = await db
+      .collection("tuitions")
+      .findOne({ _id: new ObjectId(id), isActive: true });
+
+    if (!doc) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+
+    // turn MongoDB's _id into a normal "id" field
+    const { _id, ...rest } = doc;
+    return res.json({ tuition: { id: String(_id), ...rest } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });

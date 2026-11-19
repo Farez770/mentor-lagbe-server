@@ -970,6 +970,62 @@ app.patch("/api/profile", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /api/admin/stats — platform numbers for the admin
+// Overview page (admin role only):
+//   Total Users / Total Tutors / Pending vs. Approved Tuitions
+//   / Total Stripe Revenue
+// ============================================================
+app.get("/api/admin/stats", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res
+        .status(403)
+        .json({ message: "Only admins can view platform stats" });
+    }
+
+    // 1) how many accounts exist in total
+    const totalUsers = await db.collection("users").countDocuments();
+
+    // 2) how many of them teach (role === "tutor")
+    const totalTutors = await db
+      .collection("users")
+      .countDocuments({ role: "tutor" });
+
+    // 3) tuitions waiting for approval vs already approved
+    const pendingTuitions = await db
+      .collection("tuitions")
+      .countDocuments({ approvalStatus: "pending" });
+    const approvedTuitions = await db
+      .collection("tuitions")
+      .countDocuments({ approvalStatus: "approved" });
+
+    // 4) money collected through Stripe.
+    //    TODO (pricing step): the "payments" collection does not
+    //    exist yet — MongoDB just returns nothing, so this adds
+    //    up to 0 today. Once Stripe is wired in, every payment's
+    //    "amount" is summed here automatically.
+    const payments = await db.collection("payments").find({}).toArray();
+    const totalRevenue = payments.reduce(
+      (sum, p) => sum + (typeof p.amount === "number" ? p.amount : 0),
+      0,
+    );
+
+    return res.json({
+      stats: {
+        totalUsers,
+        totalTutors,
+        pendingTuitions,
+        approvedTuitions,
+        totalRevenue,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // Unknown route -> JSON 404 (not an HTML error page)
 // ============================================================
 app.use((req, res) => {

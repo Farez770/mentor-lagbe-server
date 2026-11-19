@@ -695,6 +695,85 @@ app.get("/api/applications/stats", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /api/applications/mine — EVERY application I have sent
+// (student role, newest first) for the "My Applications" page.
+//
+// Each row also needs the tutor's name + email and the monthly
+// fee, but applications only store a tuitionId — so after the
+// first query we JOIN the extra data in two more simple queries
+// (tuitions, then users). This also survives a deleted tuition.
+// ============================================================
+app.get("/api/applications/mine", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "student") {
+      return res
+        .status(403)
+        .json({ message: "Only students can view their applications" });
+    }
+
+    // ---------- 1) my applications, newest first ----------
+    const applications = await db
+      .collection("applications")
+      .find({ studentId: req.user.id })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    if (applications.length === 0) {
+      return res.json({ applications: [] }); // nothing to join
+    }
+
+    // ---------- 2) the tuitions I applied to (ONE query) ----------
+    // tuitionId was validated as a 24-hex string when saved
+    const tuitionIds = applications.map((a) => a.tuitionId);
+    const tuitions = await db
+      .collection("tuitions")
+      .find({ _id: { $in: tuitionIds.map((id) => new ObjectId(id)) } })
+      .toArray();
+    const tuitionById = new Map(tuitions.map((t) => [String(t._id), t]));
+
+    // ---------- 3) the tutors' emails (ONE query) ----------
+    // tuitions only store postedBy (the user id), not the email
+    const tutorIds = [
+      ...new Set(tuitions.map((t) => String(t.postedBy))),
+    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+    const tutors =
+      tutorIds.length > 0
+        ? await db
+            .collection("users")
+            .find({ _id: { $in: tutorIds.map((id) => new ObjectId(id)) } })
+            .toArray()
+        : [];
+    const tutorById = new Map(tutors.map((u) => [String(u._id), u]));
+
+    // ---------- 4) merge everything into one flat row ----------
+    const list = applications.map((a) => {
+      const tuition = tuitionById.get(a.tuitionId); // may be undefined
+      const tutor = tuition
+        ? tutorById.get(String(tuition.postedBy))
+        : undefined;
+
+      return {
+        id: String(a._id),
+        tuitionId: a.tuitionId,
+        // live title/fee when the post still exists, otherwise
+        // the snapshot saved on the application / a placeholder
+        tuitionTitle: tuition?.title ?? a.tuitionTitle,
+        tutorName: tuition?.tutorName ?? "(unknown tutor)",
+        tutorEmail: tutor?.email ?? "(unknown email)",
+        fee: typeof tuition?.fee === "number" ? tuition.fee : null,
+        appliedAt: a.createdAt,
+        status: a.status, // pending | accepted | rejected
+      };
+    });
+
+    return res.json({ applications: list });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // PATCH /api/applications/:id — the tutor moves ONE application
 // to "accepted" or "rejected" (the status update from the
 // requirement). Only the tutor who owns the tuition may decide.
@@ -745,6 +824,56 @@ app.patch("/api/applications/:id", verifyToken, async (req, res) => {
           : "Application rejected",
       application: { ...rest, status, id: String(_id) },
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// DELETE /api/applications/:id — the student CANCELS one of
+// their OWN applications, but only while it is still pending
+// (once the tutor decided, the row stays as a record).
+// ============================================================
+app.delete("/api/applications/:id", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "student") {
+      return res
+        .status(403)
+        .json({ message: "Only students can cancel applications" });
+    }
+
+    const { id } = req.params;
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res.status(404).json({ message: "Application not found" });
+    }
+
+    const application = await db
+      .collection("applications")
+      .findOne({ _id: new ObjectId(id) });
+    if (!application) {
+      return res.status(404).json({ message: "Application not found" });
+    }
+
+    // ownership: only the student who SENT it may cancel it
+    if (application.studentId !== req.user.id) {
+      return res.status(403).json({
+        message: "You can only cancel your own applications",
+      });
+    }
+
+    // state rule: accepted / rejected rows can no longer be touched
+    if (application.status !== "pending") {
+      return res.status(409).json({
+        message: `Only pending applications can be cancelled — this one is already ${application.status}`,
+      });
+    }
+
+    await db
+      .collection("applications")
+      .deleteOne({ _id: new ObjectId(id) });
+
+    return res.json({ message: "Application cancelled" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });

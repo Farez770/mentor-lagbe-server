@@ -90,6 +90,49 @@ async function verifyToken(req, res, next) {
 }
 
 // ============================================================
+// validateTuition — the rules every tuition must pass.
+// Shared by POST (create) and PATCH (edit) so the two can
+// never disagree. Returns an array of error messages;
+// an empty array means "all good".
+// ============================================================
+function validateTuition(body) {
+  const { title, subject, classLevel, mode, location, fee, days, description, image } =
+    body || {};
+  const errors = [];
+
+  if (typeof title !== "string" || title.trim().length < 5) {
+    errors.push("Title must be at least 5 characters");
+  }
+  if (typeof subject !== "string" || !subject.trim()) {
+    errors.push("Subject is required");
+  }
+  if (typeof classLevel !== "string" || !classLevel.trim()) {
+    errors.push("Class level is required");
+  }
+  if (mode !== "Online" && mode !== "Offline") {
+    errors.push("Mode must be Online or Offline");
+  }
+  // Location is only required for offline tuitions
+  if (mode === "Offline" && (!location || !location.trim())) {
+    errors.push("Location is required for offline tuitions");
+  }
+  if (typeof fee !== "number" || Number.isNaN(fee) || fee < 0) {
+    errors.push("Monthly fee must be a valid number");
+  }
+  if (typeof days !== "number" || days < 1 || days > 7) {
+    errors.push("Days per week must be between 1 and 7");
+  }
+  if (typeof description !== "string" || description.trim().length < 20) {
+    errors.push("Description must be at least 20 characters");
+  }
+  if (typeof image !== "string" || !image.startsWith("http")) {
+    errors.push("A banner image is required");
+  }
+
+  return errors;
+}
+
+// ============================================================
 // POST /api/tuitions — a tutor posts a new tuition
 //
 // Project rules:
@@ -119,37 +162,8 @@ app.post("/api/tuitions", verifyToken, async (req, res) => {
       image, // banner URL (uploaded to ImgBB by the browser)
     } = req.body || {};
 
-    // --- validate every field ---
-    const errors = [];
-
-    if (typeof title !== "string" || title.trim().length < 5) {
-      errors.push("Title must be at least 5 characters");
-    }
-    if (typeof subject !== "string" || !subject.trim()) {
-      errors.push("Subject is required");
-    }
-    if (typeof classLevel !== "string" || !classLevel.trim()) {
-      errors.push("Class level is required");
-    }
-    if (mode !== "Online" && mode !== "Offline") {
-      errors.push("Mode must be Online or Offline");
-    }
-    // Location is only required for offline tuitions
-    if (mode === "Offline" && (!location || !location.trim())) {
-      errors.push("Location is required for offline tuitions");
-    }
-    if (typeof fee !== "number" || Number.isNaN(fee) || fee < 0) {
-      errors.push("Monthly fee must be a valid number");
-    }
-    if (typeof days !== "number" || days < 1 || days > 7) {
-      errors.push("Days per week must be between 1 and 7");
-    }
-    if (typeof description !== "string" || description.trim().length < 20) {
-      errors.push("Description must be at least 20 characters");
-    }
-    if (typeof image !== "string" || !image.startsWith("http")) {
-      errors.push("A banner image is required");
-    }
+    // --- validate every field (rules shared with PATCH) ---
+    const errors = validateTuition(req.body);
 
     if (errors.length > 0) {
       return res.status(400).json({ message: errors[0], errors });
@@ -340,6 +354,169 @@ app.get("/api/tuitions/:id", async (req, res) => {
     // turn MongoDB's _id into a normal "id" field
     const { _id, ...rest } = doc;
     return res.json({ tuition: { id: String(_id), ...rest } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// getOwnedTuition — shared step for the edit / toggle / delete
+// routes below. It:
+//   1. checks the id format      -> 404 if broken
+//   2. loads the tuition         -> 404 if it does not exist
+//   3. checks it belongs to the  -> 403 if not yours
+//      logged-in tutor
+// Returns the document, or null after sending the response.
+// ============================================================
+async function getOwnedTuition(req, res) {
+  const { id } = req.params;
+
+  if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+    res.status(404).json({ message: "Tuition not found" });
+    return null;
+  }
+
+  const doc = await db
+    .collection("tuitions")
+    .findOne({ _id: new ObjectId(id) });
+
+  if (!doc) {
+    res.status(404).json({ message: "Tuition not found" });
+    return null;
+  }
+
+  if (doc.postedBy !== req.user.id) {
+    res.status(403).json({ message: "You can only change your own tuitions" });
+    return null;
+  }
+
+  return doc;
+}
+
+// ============================================================
+// PATCH /api/tuitions/:id — edit a tuition's details
+// (My Tuitions page -> Edit button)
+//
+// Only the form fields change. approvalStatus is NEVER touched
+// here — only the admin approves / rejects a post.
+// ============================================================
+app.patch("/api/tuitions/:id", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "tutor") {
+      return res
+        .status(403)
+        .json({ message: "Only tutors can edit tuitions" });
+    }
+
+    const tuition = await getOwnedTuition(req, res);
+    if (!tuition) return; // error response already sent
+
+    // same rules as creating a tuition
+    const errors = validateTuition(req.body);
+    if (errors.length > 0) {
+      return res.status(400).json({ message: errors[0], errors });
+    }
+
+    const {
+      title,
+      subject,
+      classLevel,
+      mode,
+      location,
+      fee,
+      days,
+      description,
+      image,
+    } = req.body;
+
+    // build the object that will be saved
+    const updates = {
+      title: title.trim(),
+      subject: subject.trim(),
+      classLevel: classLevel.trim(),
+      mode,
+      location: location && location.trim() ? location.trim() : "Online",
+      fee,
+      days,
+      description: description.trim(),
+      image,
+      // NOTE: approvalStatus stays as it is — the admin changes it
+    };
+
+    await db
+      .collection("tuitions")
+      .updateOne({ _id: new ObjectId(req.params.id) }, { $set: updates });
+
+    // answer with the fresh document (as {"id": ...})
+    const { _id, ...rest } = { ...tuition, ...updates };
+    return res.json({
+      message: "Tuition updated",
+      tuition: { ...rest, id: String(_id) },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// PATCH /api/tuitions/:id/toggle — Active <-> Closed
+// (My Tuitions page -> Close / Reopen button)
+//
+// The server simply flips the current isActive value.
+// ============================================================
+app.patch("/api/tuitions/:id/toggle", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "tutor") {
+      return res
+        .status(403)
+        .json({ message: "Only tutors can change tuition status" });
+    }
+
+    const tuition = await getOwnedTuition(req, res);
+    if (!tuition) return; // error response already sent
+
+    const newActive = !tuition.isActive; // flip it
+
+    await db
+      .collection("tuitions")
+      .updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { isActive: newActive } },
+      );
+
+    const { _id, ...rest } = { ...tuition, isActive: newActive };
+    return res.json({
+      message: newActive ? "Tuition is now active" : "Tuition closed",
+      tuition: { ...rest, id: String(_id) },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// DELETE /api/tuitions/:id — remove a tuition post forever
+// (My Tuitions page -> Delete button)
+// ============================================================
+app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "tutor") {
+      return res
+        .status(403)
+        .json({ message: "Only tutors can delete tuitions" });
+    }
+
+    const tuition = await getOwnedTuition(req, res);
+    if (!tuition) return; // error response already sent
+
+    await db
+      .collection("tuitions")
+      .deleteOne({ _id: new ObjectId(req.params.id) });
+
+    return res.json({ message: "Tuition deleted" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });

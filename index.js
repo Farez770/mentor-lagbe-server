@@ -524,6 +524,192 @@ app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// APPLICATIONS — a student applies for a tuition, the tutor
+// accepts or rejects it. This is the4th collection from the
+// project requirement: users, tuitions, applications, payments.
+// ============================================================
+
+// POST /api/applications — send an application (login required)
+//
+// Any signed-in user may apply (kept open for the demo — a real
+// platform could restrict this later). Name/email/phone come
+// from the form; studentId comes from the session so duplicate
+// applications can be detected.
+app.post("/api/applications", verifyToken, async (req, res) => {
+  try {
+    const {
+      tuitionId,
+      studentName,
+      studentEmail,
+      studentPhone,
+      preferredSchedule,
+      note,
+    } = req.body || {};
+
+    // ---------- 1) validate the form ----------
+    const errors = [];
+    if (typeof tuitionId !== "string" || !tuitionId.trim()) {
+      errors.push("Tuition id is required");
+    }
+    if (typeof studentName !== "string" || studentName.trim().length < 2) {
+      errors.push("Your name is required");
+    }
+    if (typeof studentEmail !== "string" || !studentEmail.includes("@")) {
+      errors.push("A valid email is required");
+    }
+    if (typeof studentPhone !== "string" || !studentPhone.trim()) {
+      errors.push("Your phone number is required");
+    }
+    if (typeof preferredSchedule !== "string" || !preferredSchedule.trim()) {
+      errors.push("Preferred schedule is required");
+    }
+    if (note !== undefined && note !== null && typeof note !== "string") {
+      errors.push("Note must be text");
+    }
+    if (errors.length > 0) {
+      return res.status(400).json({ message: errors[0], errors });
+    }
+
+    // ---------- 2) the tuition must exist and be open ----------
+    const cleanTuitionId = tuitionId.trim();
+    if (!/^[0-9a-fA-F]{24}$/.test(cleanTuitionId)) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+    const tuition = await db
+      .collection("tuitions")
+      .findOne({ _id: new ObjectId(cleanTuitionId), isActive: true });
+    if (!tuition) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+
+    // ---------- 3) one application per student per tuition ----------
+    const already = await db.collection("applications").findOne({
+      tuitionId: cleanTuitionId,
+      studentId: req.user.id,
+    });
+    if (already) {
+      return res
+        .status(400)
+        .json({ message: "You have already applied to this tuition" });
+    }
+
+    // ---------- 4) save ----------
+    const application = {
+      tuitionId: cleanTuitionId,
+      tuitionTitle: tuition.title, // snapshot — shown in the tutor's inbox
+      tutorId: String(tuition.postedBy), // saved so the tutor's inbox is ONE query
+      studentId: req.user.id, // from the session, not the form
+      studentName: studentName.trim(),
+      studentEmail: studentEmail.trim(),
+      studentPhone: studentPhone.trim(),
+      preferredSchedule: preferredSchedule.trim(),
+      note: typeof note === "string" ? note.trim() : "",
+      status: "pending", // pending -> accepted | rejected
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("applications").insertOne(application);
+
+    return res.status(201).json({
+      message: "Application sent! The tutor will review it",
+      application: { ...application, id: String(result.insertedId) },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// GET /api/applications/tutor — EVERY application that arrived
+// on this tutor's tuition posts (newest first).
+// Each application stores tutorId, so this is a single query.
+// ============================================================
+app.get("/api/applications/tutor", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "tutor") {
+      return res
+        .status(403)
+        .json({ message: "Only tutors can view applicants" });
+    }
+
+    const applications = await db
+      .collection("applications")
+      .find({ tutorId: req.user.id })
+      .sort({ createdAt: -1 }) // newest first
+      .toArray();
+
+    // turn every _id into a normal "id" field
+    const list = applications.map(({ _id, ...rest }) => ({
+      ...rest,
+      id: String(_id),
+    }));
+
+    return res.json({ applications: list });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// PATCH /api/applications/:id — the tutor moves ONE application
+// to "accepted" or "rejected" (the status update from the
+// requirement). Only the tutor who owns the tuition may decide.
+// ============================================================
+app.patch("/api/applications/:id", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "tutor") {
+      return res
+        .status(403)
+        .json({ message: "Only tutors can review applicants" });
+    }
+
+    const { id } = req.params;
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res.status(404).json({ message: "Application not found" });
+    }
+
+    const application = await db
+      .collection("applications")
+      .findOne({ _id: new ObjectId(id) });
+    if (!application) {
+      return res.status(404).json({ message: "Application not found" });
+    }
+
+    // ownership: this application belongs to one of MY tuitions
+    if (application.tutorId !== req.user.id) {
+      return res.status(403).json({
+        message: "You can only review applications to your own tuitions",
+      });
+    }
+
+    const { status } = req.body || {};
+    if (status !== "accepted" && status !== "rejected") {
+      return res
+        .status(400)
+        .json({ message: "Status must be accepted or rejected" });
+    }
+
+    await db
+      .collection("applications")
+      .updateOne({ _id: new ObjectId(id) }, { $set: { status } });
+
+    const { _id, ...rest } = application;
+    return res.json({
+      message:
+        status === "accepted"
+          ? "Application accepted"
+          : "Application rejected",
+      application: { ...rest, status, id: String(_id) },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // Unknown route -> JSON 404 (not an HTML error page)
 // ============================================================
 app.use((req, res) => {

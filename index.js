@@ -1153,6 +1153,124 @@ app.patch("/api/admin/users/:id", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /api/admin/tuitions — EVERY tuition post ever submitted
+// by a tutor, for the approval page (/dashboard/admin/tuitions).
+// Admin role only. Posts already store tutorName/tutorImage
+// (denormalized when posted), so we only join the tutor's
+// EMAIL from the users collection.
+// ============================================================
+app.get("/api/admin/tuitions", verifyToken, async (req, res) => {
+  try {
+    // ---------- 1) only admins may review posts ----------
+    if (req.user.role !== "admin") {
+      return res
+        .status(403)
+        .json({ message: "Only admins can review tuitions" });
+    }
+
+    // ---------- 2) load every post, newest first ----------
+    // No filter on purpose: admins must see pending, approved
+    // AND rejected posts (plus paused ones) in one place.
+    const list = await db
+      .collection("tuitions")
+      .find({})
+      .sort({ createdAt: -1 }) // newest posts first
+      .toArray();
+
+    // ---------- 3) the tutors' emails (ONE query) ----------
+    // postedBy is a plain string id — collect the unique ones,
+    // keep only valid 24-hex ids, then fetch them in one go.
+    const tutorIds = [
+      ...new Set(list.map((t) => String(t.postedBy))),
+    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+    const tutors =
+      tutorIds.length > 0
+        ? await db
+            .collection("users")
+            .find({ _id: { $in: tutorIds.map((id) => new ObjectId(id)) } })
+            .toArray()
+        : [];
+    const tutorById = new Map(tutors.map((u) => [String(u._id), u]));
+
+    // ---------- 4) merge into flat rows for the page ----------
+    const tuitions = list.map((t) => {
+      const { _id, ...rest } = t; // _id -> "id" below
+      const tutor = tutorById.get(String(t.postedBy)); // may be undefined
+      return {
+        ...rest, // title, subject, classLevel, mode, fee, ...
+        id: String(_id), // string id the frontend can use
+        tutorName: t.tutorName || "(unknown tutor)", // saved at post time
+        tutorEmail: tutor?.email || "(unknown email)", // joined just now
+        approvalStatus: t.approvalStatus || "pending", // older docs default
+      };
+    });
+
+    return res.json({ tuitions });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// PATCH /api/admin/tuitions/:id — APPROVE or REJECT one post
+// (the Admin Tuition Approval Flow). Admin role only.
+// ============================================================
+app.patch("/api/admin/tuitions/:id", verifyToken, async (req, res) => {
+  try {
+    // ---------- 1) only admins may decide ----------
+    if (req.user.role !== "admin") {
+      return res
+        .status(403)
+        .json({ message: "Only admins can approve or reject tuitions" });
+    }
+
+    // ---------- 2) validate the id format ----------
+    const { id } = req.params;
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+
+    // ---------- 3) validate the new status ----------
+    // Only the two decisions from the requirement are allowed
+    // (setting it back to "pending" is not part of the flow).
+    const { approvalStatus } = req.body || {};
+    if (approvalStatus !== "approved" && approvalStatus !== "rejected") {
+      return res
+        .status(400)
+        .json({ message: "approvalStatus must be approved or rejected" });
+    }
+
+    // ---------- 4) the post must exist ----------
+    const tuition = await db
+      .collection("tuitions")
+      .findOne({ _id: new ObjectId(id) });
+    if (!tuition) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+
+    // ---------- 5) write the decision ----------
+    // Only this one field changes — the rest of the post is
+    // untouched, and the admin can flip the decision later.
+    await db
+      .collection("tuitions")
+      .updateOne({ _id: new ObjectId(id) }, { $set: { approvalStatus } });
+
+    // ---------- 6) answer with the new status ----------
+    return res.json({
+      message: `Tuition ${approvalStatus}`, // "Tuition approved" / "Tuition rejected"
+      tuition: {
+        id: String(tuition._id),
+        approvalStatus, // the NEW status
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // Unknown route -> JSON 404 (not an HTML error page)
 // ============================================================
 app.use((req, res) => {

@@ -537,6 +537,18 @@ app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
 // applications can be detected.
 app.post("/api/applications", verifyToken, async (req, res) => {
   try {
+    // ==========================================================
+    // ROLE RULE (project requirement): ONLY students may apply.
+    // Tutors and admins get a 403 here — the details page also
+    // disables the button for them, but the API must never
+    // trust what the UI shows.
+    // ==========================================================
+    if (req.user.role !== "student") {
+      return res
+        .status(403)
+        .json({ message: "Only students can apply for tuitions" });
+    }
+
     const {
       tuitionId,
       studentName,

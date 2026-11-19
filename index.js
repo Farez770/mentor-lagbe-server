@@ -240,6 +240,82 @@ app.get("/api/tuitions/mine", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /api/tuitions — PUBLIC list for the Browse Tuitions page
+// (no login needed — anyone can browse)
+//
+// TODO (Phase 5 — admin approval): once the admin can approve
+// listings, add approvalStatus: "approved" to the filter so
+// students only ever see approved tuitions. Until then every
+// ACTIVE post shows, so a tutor can find their own new post.
+// ============================================================
+app.get("/api/tuitions", async (req, res) => {
+  try {
+    const list = await db
+      .collection("tuitions")
+      .find({ isActive: true }) // only live listings
+      .sort({ createdAt: -1 }) // newest first
+      .toArray();
+
+    // turn MongoDB's _id into a normal "id" field
+    const tuitions = list.map((doc) => {
+      const { _id, ...rest } = doc;
+      return { id: String(_id), ...rest };
+    });
+
+    return res.json({ tuitions });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// GET /api/tuitions/stats — the REAL numbers on the tutor's
+// Overview dashboard (login required, tutors only)
+//
+//   total      = every tuition this tutor ever posted
+//   approved   = approved + live (admin approves in Phase 5)
+//   pending    = waiting for admin approval
+//   applicants = students who applied (0 until Phase 3)
+// ============================================================
+app.get("/api/tuitions/stats", verifyToken, async (req, res) => {
+  try {
+    // Only tutors have a dashboard with these numbers
+    if (req.user.role !== "tutor") {
+      return res
+        .status(403)
+        .json({ message: "Only tutors can see tuition stats" });
+    }
+
+    const postedBy = req.user.id; // the logged-in tutor
+
+    const total = await db
+      .collection("tuitions")
+      .countDocuments({ postedBy });
+
+    const approved = await db.collection("tuitions").countDocuments({
+      postedBy,
+      approvalStatus: "approved",
+      isActive: true,
+    });
+
+    const pending = await db.collection("tuitions").countDocuments({
+      postedBy,
+      approvalStatus: "pending",
+    });
+
+    // TODO (Phase 3): count real applications from the
+    // "applications" collection once students can apply
+    const applicants = 0;
+
+    return res.json({ total, approved, pending, applicants });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // Unknown route -> JSON 404 (not an HTML error page)
 // ============================================================
 app.use((req, res) => {

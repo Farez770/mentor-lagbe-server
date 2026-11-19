@@ -653,6 +653,48 @@ app.get("/api/applications/tutor", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /api/applications/stats — MY application numbers for
+// the student dashboard's Overview cards:
+//   Total Applied Tuitions / Accepted / Pending + my plan
+// (student role only — mirrors GET /api/tuitions/stats)
+// ============================================================
+app.get("/api/applications/stats", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "student") {
+      return res
+        .status(403)
+        .json({ message: "Only students can view application stats" });
+    }
+
+    const studentId = req.user.id; // comes from the session token
+
+    // Three simple counting queries (clearer than an aggregation
+    // pipeline for beginners — this collection stays small)
+    const totalApplied = await db
+      .collection("applications")
+      .countDocuments({ studentId });
+    const accepted = await db
+      .collection("applications")
+      .countDocuments({ studentId, status: "accepted" });
+    const pending = await db
+      .collection("applications")
+      .countDocuments({ studentId, status: "pending" });
+
+    return res.json({
+      stats: {
+        totalApplied,
+        accepted,
+        pending,
+        plan: req.user.plan || "free", // "free" | "pro"
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // PATCH /api/applications/:id — the tutor moves ONE application
 // to "accepted" or "rejected" (the status update from the
 // requirement). Only the tutor who owns the tuition may decide.

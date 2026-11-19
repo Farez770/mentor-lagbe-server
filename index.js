@@ -1026,6 +1026,133 @@ app.get("/api/admin/stats", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /api/admin/users — EVERY registered user for the
+// User Management page (/dashboard/admin/users).
+// Admin role only. Only safe fields are returned (no account
+// secrets — passwords live in the separate "account" collection
+// and are never queried here).
+// ============================================================
+app.get("/api/admin/users", verifyToken, async (req, res) => {
+  try {
+    // ---------- 1) only admins may see the full user list ----------
+    if (req.user.role !== "admin") {
+      return res
+        .status(403)
+        .json({ message: "Only admins can view all users" });
+    }
+
+    // ---------- 2) load every user, newest first ----------
+    // The projection picks ONLY the columns the page shows —
+    // anything not listed here never leaves the server.
+    const users = await db
+      .collection("users")
+      .find(
+        {}, // no filter -> all users
+        {
+          projection: {
+            _id: 1, // becomes "id" below
+            name: 1,
+            email: 1,
+            image: 1, // "" when the user has no photo
+            role: 1, // "student" | "tutor" | "admin"
+            plan: 1, // "free" | "pro"
+            createdAt: 1, // join date
+          },
+        },
+      )
+      .sort({ createdAt: -1 }) // newest accounts first
+      .toArray();
+
+    // ---------- 3) turn Mongo's _id into a normal "id" field ----------
+    const list = users.map(({ _id, ...rest }) => ({
+      ...rest,
+      id: String(_id), // string id the frontend can use
+      name: rest.name || "", // defaults for older/odd documents
+      email: rest.email || "",
+      image: rest.image || "",
+      role: rest.role || "student", // same default as BetterAuth
+      plan: rest.plan || "free",
+      createdAt: rest.createdAt || null,
+    }));
+
+    return res.json({ users: list });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// PATCH /api/admin/users/:id — change ONE user's role
+// (student | tutor | admin). Admin role only.
+// ============================================================
+app.patch("/api/admin/users/:id", verifyToken, async (req, res) => {
+  try {
+    // ---------- 1) only admins may change roles ----------
+    if (req.user.role !== "admin") {
+      return res
+        .status(403)
+        .json({ message: "Only admins can change roles" });
+    }
+
+    // ---------- 2) validate the id format ----------
+    const { id } = req.params;
+    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // ---------- 3) validate the new role ----------
+    const { role } = req.body || {};
+    if (role !== "student" && role !== "tutor" && role !== "admin") {
+      return res
+        .status(400)
+        .json({ message: "Role must be student, tutor or admin" });
+    }
+
+    // ---------- 4) nobody may demote THEMSELVES ----------
+    // Without this an admin could remove their own "admin"
+    // role by accident and then nobody could manage users.
+    if (id === req.user.id) {
+      return res
+        .status(400)
+        .json({ message: "You cannot change your own role" });
+    }
+
+    // ---------- 5) the target user must exist ----------
+    const user = await db
+      .collection("users")
+      .findOne({ _id: new ObjectId(id) });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // ---------- 6) write the new role ----------
+    // verifyToken reads the role from the DB on every request,
+    // so the change takes effect immediately — no re-login.
+    await db
+      .collection("users")
+      .updateOne({ _id: new ObjectId(id) }, { $set: { role } });
+
+    // ---------- 7) answer with the updated row ----------
+    return res.json({
+      message: `${user.name || user.email} is now ${role}`,
+      user: {
+        id: String(user._id),
+        name: user.name || "",
+        email: user.email || "",
+        image: user.image || "",
+        role, // the NEW role
+        plan: user.plan || "free",
+        createdAt: user.createdAt || null,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // Unknown route -> JSON 404 (not an HTML error page)
 // ============================================================
 app.use((req, res) => {

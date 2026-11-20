@@ -4,6 +4,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe"; // official Stripe SDK (only the payments route uses it)
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -23,6 +24,16 @@ export async function connectToMongoDB() {
 
 const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("mentor-lagbe");
+
+// ============================================================
+// Stripe client — used ONLY by /api/payments/verify.
+// The secret key lives in .env (same test key as the client's
+// .env.local). If it is missing the route answers with a clear
+// 500 instead of crashing the whole server at boot.
+// ============================================================
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
@@ -347,6 +358,9 @@ app.get("/api/tuitions/:id", async (req, res) => {
       .collection("tuitions")
       .findOne({ _id: new ObjectId(id), isActive: true });
 
+    // TODO (pro features): join the tutor's plan (users.plan)
+    // here so the details page can show the Pro "verified badge"
+
     if (!doc) {
       return res.status(404).json({ message: "Tuition not found" });
     }
@@ -536,6 +550,9 @@ app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
 // from the form; studentId comes from the session so duplicate
 // applications can be detected.
 app.post("/api/applications", verifyToken, async (req, res) => {
+  // TODO (pro features): priority booking for Pro students —
+  // e.g. sort the tutor's applicant list so pro applications
+  // (users.plan === "pro") appear first in Manage Applicants
   try {
     // ==========================================================
     // ROLE RULE (project requirement): ONLY students may apply.
@@ -999,11 +1016,9 @@ app.get("/api/admin/stats", verifyToken, async (req, res) => {
       .collection("tuitions")
       .countDocuments({ approvalStatus: "approved" });
 
-    // 4) money collected through Stripe.
-    //    TODO (pricing step): the "payments" collection does not
-    //    exist yet — MongoDB just returns nothing, so this adds
-    //    up to 0 today. Once Stripe is wired in, every payment's
-    //    "amount" is summed here automatically.
+    // 4) money collected through Stripe — every verified checkout
+    //    is stored in "payments" by POST /api/payments/verify and
+    //    its "amount" (whole dollars: 15 / 10) is summed here.
     const payments = await db.collection("payments").find({}).toArray();
     const totalRevenue = payments.reduce(
       (sum, p) => sum + (typeof p.amount === "number" ? p.amount : 0),
@@ -1264,6 +1279,143 @@ app.patch("/api/admin/tuitions/:id", verifyToken, async (req, res) => {
         approvalStatus, // the NEW status
       },
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// POST /api/payments/verify — CHECKOUT VERIFICATION
+//
+// Project requirement:
+//   "Use Stripe Webhook (or checkout verification) to save the
+//   transaction in the payments collection and update
+//   plan: 'pro' in the users collection."
+//
+// We use CHECKOUT VERIFICATION because it works locally without
+// the Stripe CLI / a public URL (a webhook TODO is noted at the
+// bottom of this route). The /payment/success page calls this
+// with the session id Stripe appended to the redirect URL.
+//
+// The browser only ever sends the session id — the server asks
+// STRIPE itself whether the money arrived, so nobody can claim
+// "I paid" from the client side.
+// ============================================================
+app.post("/api/payments/verify", verifyToken, async (req, res) => {
+  try {
+    // ---------- 1) Stripe must be configured ----------
+    if (!stripe) {
+      return res.status(500).json({
+        message: "Stripe is not configured (missing STRIPE_SECRET_KEY)",
+      });
+    }
+
+    // ---------- 2) validate the session id ----------
+    // Stripe session ids look like cs_test_AbC123... — anything
+    // else cannot exist, so reject it before calling Stripe.
+    const { sessionId } = req.body || {};
+    if (
+      typeof sessionId !== "string" ||
+      !/^cs_(test|live)_[A-Za-z0-9_-]+$/.test(sessionId)
+    ) {
+      return res.status(400).json({ message: "Invalid checkout session id" });
+    }
+
+    // ---------- 3) ask STRIPE about this session ----------
+    let session;
+    try {
+      session = await stripe.checkout.sessions.retrieve(sessionId);
+    } catch (err) {
+      // Stripe says this session id does not exist
+      console.error(err);
+      return res.status(404).json({ message: "Checkout session not found" });
+    }
+
+    // ---------- 4) it must be THIS user's session ----------
+    // metadata.userId was written server-side when the session
+    // was created — the browser cannot change it. Without this
+    // check, user B could "verify" user A's paid session and
+    // the upgrade would land on the wrong account.
+    if (session.metadata?.userId !== req.user.id) {
+      return res
+        .status(403)
+        .json({ message: "This checkout session belongs to another account" });
+    }
+
+    // ---------- 5) Stripe must say the money arrived ----------
+    if (session.payment_status !== "paid") {
+      return res
+        .status(400)
+        .json({ message: "This payment is not completed yet" });
+    }
+
+    // ---------- 6) which product did they buy ----------
+    const product = session.metadata?.plan; // "tutor" | "student"
+    if (product !== "tutor" && product !== "student") {
+      return res.status(400).json({ message: "Unknown plan on this session" });
+    }
+
+    // ---------- 7) the transaction we want to save ----------
+    // "amount" is in whole DOLLARS because /api/admin/stats sums
+    // exactly this field (1500 cents -> 15). The raw cents value
+    // is kept too, in case the UI ever needs exact Stripe data.
+    const paymentDoc = {
+      stripeSessionId: sessionId, // unique key — one row per checkout
+      stripePaymentIntentId:
+        typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : null,
+      userId: req.user.id, // the upgraded account
+      userEmail: req.user.email,
+      plan: "pro", // what we write onto the user below
+      product, // "tutor" -> $15 / "student" -> $10
+      amount: (session.amount_total ?? 0) / 100, // 1500 -> 15
+      amountCents: session.amount_total ?? 0, // raw Stripe value
+      currency: session.currency ?? "usd",
+      status: "paid",
+      createdAt: new Date(),
+    };
+
+    // ---------- 8) save it ONCE (idempotent) ----------
+    // $setOnInsert + upsert: the FIRST verify inserts the row,
+    // every later verify finds it and does nothing — revenue can
+    // never be counted twice (e.g. two open success tabs).
+    const result = await db.collection("payments").updateOne(
+      { stripeSessionId: sessionId },
+      { $setOnInsert: paymentDoc },
+      { upsert: true },
+    );
+    const isNewPayment = result.upsertedCount === 1;
+
+    // ---------- 9) upgrade the user to "pro" ----------
+    // Runs even when the payment row already existed — that
+    // repairs the rare case where an earlier verify crashed
+    // between steps 8 and 9. Setting "pro" twice is harmless.
+    await db
+      .collection("users")
+      .updateOne(
+        { _id: new ObjectId(req.user.id) },
+        { $set: { plan: "pro" } },
+      );
+
+    // ---------- 10) answer the success page ----------
+    return res.json({
+      message: isNewPayment
+        ? "Payment verified — you are now Pro!"
+        : "Payment already recorded",
+      plan: "pro",
+      payment: {
+        product, // "tutor" | "student"
+        amount: paymentDoc.amount, // 15 / 10
+        currency: paymentDoc.currency,
+      },
+    });
+
+    // TODO (hardening): add a real Stripe webhook
+    // (checkout.session.completed with signature verification via
+    // STRIPE_WEBHOOK_SECRET) so payments are recorded even when
+    // the visitor closes the success page before it loads.
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });

@@ -550,9 +550,11 @@ app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
 // from the form; studentId comes from the session so duplicate
 // applications can be detected.
 app.post("/api/applications", verifyToken, async (req, res) => {
-  // TODO (pro features): priority booking for Pro students —
-  // e.g. sort the tutor's applicant list so pro applications
-  // (users.plan === "pro") appear first in Manage Applicants
+  // PRIORITY BOOKING (Pro Student Plan): free students are NOT
+  // limited here — every student may apply as often as allowed
+  // by the tuition list. What Pro students get is ORDER: their
+  // applications are listed first in GET /api/applications/tutor
+  // (the tutor's Manage Applicants page), see the sort there.
   try {
     // ==========================================================
     // ROLE RULE (project requirement): ONLY students may apply.
@@ -651,8 +653,13 @@ app.post("/api/applications", verifyToken, async (req, res) => {
 
 // ============================================================
 // GET /api/applications/tutor — EVERY application that arrived
-// on this tutor's tuition posts (newest first).
-// Each application stores tutorId, so this is a single query.
+// on this tutor's tuition posts.
+//
+// PRIORITY BOOKING (project requirement: "Pro Student Plan $10
+// for priority booking"): applications from Pro students
+// (users.plan === "pro") are returned FIRST, the rest follows
+// newest-first. The plan is joined live from the users
+// collection, so a fresh Pro upgrade shows up immediately.
 // ============================================================
 app.get("/api/applications/tutor", verifyToken, async (req, res) => {
   try {
@@ -662,19 +669,55 @@ app.get("/api/applications/tutor", verifyToken, async (req, res) => {
         .json({ message: "Only tutors can view applicants" });
     }
 
+    // ---------- 1) all applications on my tuitions, newest first ----------
     const applications = await db
       .collection("applications")
       .find({ tutorId: req.user.id })
-      .sort({ createdAt: -1 }) // newest first
+      .sort({ createdAt: -1 }) // newest first (used inside each group)
       .toArray();
 
-    // turn every _id into a normal "id" field
-    const list = applications.map(({ _id, ...rest }) => ({
-      ...rest,
+    if (applications.length === 0) {
+      return res.json({ applications: [] }); // nothing to join
+    }
+
+    // ---------- 2) join each student's PLAN (ONE query) ----------
+    // applications store studentId as a plain string id — collect
+    // the unique ones, keep valid 24-hex ids, fetch in one go
+    // (same trick as the admin transactions endpoint).
+    const studentIds = [
+      ...new Set(applications.map((a) => String(a.studentId))),
+    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+    const students =
+      studentIds.length > 0
+        ? await db
+            .collection("users")
+            .find(
+              { _id: { $in: studentIds.map((id) => new ObjectId(id)) } },
+              { projection: { plan: 1 } }, // only what we need
+            )
+            .toArray()
+        : [];
+    const planById = new Map(students.map((u) => [String(u._id), u.plan]));
+
+    // ---------- 3) attach studentPlan to every row ----------
+    const withPlan = applications.map(({ _id, ...rest }) => ({
+      ...rest, // studentName, studentEmail, status, tuitionTitle, ...
       id: String(_id),
+      // "pro" only when the account really is Pro, else "free"
+      studentPlan:
+        String(planById.get(String(rest.studentId)) || "free").toLowerCase() ===
+        "pro"
+          ? "pro"
+          : "free",
     }));
 
-    return res.json({ applications: list });
+    // ---------- 4) PRIORITY BOOKING: Pro students first ----------
+    // A stable partition: Pro rows keep their newest-first order,
+    // free rows keep theirs, Pro rows simply come out on top.
+    const priority = withPlan.filter((a) => a.studentPlan === "pro");
+    const regular = withPlan.filter((a) => a.studentPlan !== "pro");
+
+    return res.json({ applications: [...priority, ...regular] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });

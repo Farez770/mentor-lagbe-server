@@ -1286,6 +1286,88 @@ app.patch("/api/admin/tuitions/:id", verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// GET /api/admin/transactions — EVERY Stripe payment row from
+// the "payments" collection, for the Transaction Management page
+// (/dashboard/admin/transactions).
+//
+// Project requirement:
+//   "Display all Stripe subscription payment records from the
+//   payments collection (User Name, Email, Role, Plan Name,
+//   Amount, Transaction ID, Payment Date)."
+//
+// Admin role only. The payments collection stores the buyer's id
+// as a STRING — we join the users collection to get the name and
+// role back (the email is also saved on the payment itself, so
+// deleted accounts still show something sensible).
+// ============================================================
+app.get("/api/admin/transactions", verifyToken, async (req, res) => {
+  try {
+    // ---------- 1) only admins may see the money ----------
+    if (req.user.role !== "admin") {
+      return res
+        .status(403)
+        .json({ message: "Only admins can view transactions" });
+    }
+
+    // ---------- 2) every payment row, newest first ----------
+    const list = await db
+      .collection("payments")
+      .find({})
+      .sort({ createdAt: -1 }) // latest transactions at the top
+      .toArray();
+
+    // ---------- 3) join the buyers (ONE query) ----------
+    // userId is a plain string id — collect the unique ones,
+    // keep only valid 24-hex ids, then fetch them in one go.
+    // (same trick as the admin tuitions endpoint above)
+    const buyerIds = [
+      ...new Set(list.map((p) => String(p.userId))),
+    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+    const buyers =
+      buyerIds.length > 0
+        ? await db
+            .collection("users")
+            .find({ _id: { $in: buyerIds.map((id) => new ObjectId(id)) } })
+            .toArray()
+        : [];
+    const buyerById = new Map(buyers.map((u) => [String(u._id), u]));
+
+    // ---------- 4) merge into flat rows for the table ----------
+    const transactions = list.map((p) => {
+      const buyer = buyerById.get(String(p.userId)); // may be undefined
+
+      // "student" / "tutor" -> "Pro Student Plan" / "Pro Tutor Plan"
+      const planName =
+        p.product === "tutor"
+          ? "Pro Tutor Plan"
+          : p.product === "student"
+            ? "Pro Student Plan"
+            : p.planName || "Pro Plan"; // older/odd docs
+
+      return {
+        id: String(p._id), // row key for React
+        userName: buyer?.name || "(deleted user)", // joined from users
+        userEmail: buyer?.email || p.userEmail || "(unknown email)",
+        role: buyer?.role || "unknown", // student | tutor | admin
+        planName, // what was bought
+        amount: typeof p.amount === "number" ? p.amount : 0, // whole dollars
+        currency: p.currency || "usd",
+        // Stripe's payment id = the transaction id on the page
+        // (falls back to the checkout session id for old rows)
+        transactionId: p.stripePaymentIntentId || p.stripeSessionId || "",
+        paymentDate: p.createdAt || null, // ISO date of the payment
+        status: p.status || "paid", // paid | ...
+      };
+    });
+
+    return res.json({ transactions });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
 // POST /api/payments/verify — CHECKOUT VERIFICATION
 //
 // Project requirement:

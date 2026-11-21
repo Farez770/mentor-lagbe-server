@@ -107,8 +107,17 @@ async function verifyToken(req, res, next) {
 // an empty array means "all good".
 // ============================================================
 function validateTuition(body) {
-  const { title, subject, classLevel, mode, location, fee, days, description, image } =
-    body || {};
+  const {
+    title,
+    subject,
+    classLevel,
+    mode,
+    location,
+    fee,
+    days,
+    description,
+    image,
+  } = body || {};
   const errors = [];
 
   if (typeof title !== "string" || title.trim().length < 5) {
@@ -268,17 +277,22 @@ app.get("/api/tuitions/mine", verifyToken, async (req, res) => {
 // GET /api/tuitions — PUBLIC list for the Browse Tuitions page
 // (no login needed — anyone can browse)
 //
-// TODO (Phase 5 — admin approval): once the admin can approve
-// listings, add approvalStatus: "approved" to the filter so
-// students only ever see approved tuitions. Until then every
-// ACTIVE post shows, so a tutor can find their own new post.
+// Project requirement: ONLY posts where
+//   approvalStatus === "approved" AND isActive === true
+// appear on the public Browse Tuitions page. A pending or
+// rejected post, or a closed one, is invisible here — and the
+// Featured section on the home page uses this same endpoint,
+// so it follows the exact same rule.
 // ============================================================
 app.get("/api/tuitions", async (req, res) => {
   try {
     const list = await db
       .collection("tuitions")
-      .find({ isActive: true }) // only live listings
-      .sort({ createdAt: -1 }) // newest first
+      .find({
+        approvalStatus: "approved", // admin must have approved it
+        isActive: true, // and the listing must still be live
+      })
+      .sort({ createdAt: -1 }) // newest first (featured takes 6)
       .toArray();
 
     // turn MongoDB's _id into a normal "id" field
@@ -418,9 +432,7 @@ async function getOwnedTuition(req, res) {
 app.patch("/api/tuitions/:id", verifyToken, async (req, res) => {
   try {
     if (req.user.role !== "tutor") {
-      return res
-        .status(403)
-        .json({ message: "Only tutors can edit tuitions" });
+      return res.status(403).json({ message: "Only tutors can edit tuitions" });
     }
 
     const tuition = await getOwnedTuition(req, res);
@@ -891,9 +903,7 @@ app.patch("/api/applications/:id", verifyToken, async (req, res) => {
     const { _id, ...rest } = application;
     return res.json({
       message:
-        status === "accepted"
-          ? "Application accepted"
-          : "Application rejected",
+        status === "accepted" ? "Application accepted" : "Application rejected",
       application: { ...rest, status, id: String(_id) },
     });
   } catch (err) {
@@ -941,9 +951,7 @@ app.delete("/api/applications/:id", verifyToken, async (req, res) => {
       });
     }
 
-    await db
-      .collection("applications")
-      .deleteOne({ _id: new ObjectId(id) });
+    await db.collection("applications").deleteOne({ _id: new ObjectId(id) });
 
     return res.json({ message: "Application cancelled" });
   } catch (err) {
@@ -1148,9 +1156,7 @@ app.patch("/api/admin/users/:id", verifyToken, async (req, res) => {
   try {
     // ---------- 1) only admins may change roles ----------
     if (req.user.role !== "admin") {
-      return res
-        .status(403)
-        .json({ message: "Only admins can change roles" });
+      return res.status(403).json({ message: "Only admins can change roles" });
     }
 
     // ---------- 2) validate the id format ----------
@@ -1238,9 +1244,9 @@ app.get("/api/admin/tuitions", verifyToken, async (req, res) => {
     // ---------- 3) the tutors' emails (ONE query) ----------
     // postedBy is a plain string id — collect the unique ones,
     // keep only valid 24-hex ids, then fetch them in one go.
-    const tutorIds = [
-      ...new Set(list.map((t) => String(t.postedBy))),
-    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+    const tutorIds = [...new Set(list.map((t) => String(t.postedBy)))].filter(
+      (id) => /^[0-9a-fA-F]{24}$/.test(id),
+    ); // safety first
     const tutors =
       tutorIds.length > 0
         ? await db
@@ -1363,9 +1369,9 @@ app.get("/api/admin/transactions", verifyToken, async (req, res) => {
     // userId is a plain string id — collect the unique ones,
     // keep only valid 24-hex ids, then fetch them in one go.
     // (same trick as the admin tuitions endpoint above)
-    const buyerIds = [
-      ...new Set(list.map((p) => String(p.userId))),
-    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+    const buyerIds = [...new Set(list.map((p) => String(p.userId)))].filter(
+      (id) => /^[0-9a-fA-F]{24}$/.test(id),
+    ); // safety first
     const buyers =
       buyerIds.length > 0
         ? await db
@@ -1506,11 +1512,13 @@ app.post("/api/payments/verify", verifyToken, async (req, res) => {
     // $setOnInsert + upsert: the FIRST verify inserts the row,
     // every later verify finds it and does nothing — revenue can
     // never be counted twice (e.g. two open success tabs).
-    const result = await db.collection("payments").updateOne(
-      { stripeSessionId: sessionId },
-      { $setOnInsert: paymentDoc },
-      { upsert: true },
-    );
+    const result = await db
+      .collection("payments")
+      .updateOne(
+        { stripeSessionId: sessionId },
+        { $setOnInsert: paymentDoc },
+        { upsert: true },
+      );
     const isNewPayment = result.upsertedCount === 1;
 
     // ---------- 9) upgrade the user to "pro" ----------
@@ -1519,10 +1527,7 @@ app.post("/api/payments/verify", verifyToken, async (req, res) => {
     // between steps 8 and 9. Setting "pro" twice is harmless.
     await db
       .collection("users")
-      .updateOne(
-        { _id: new ObjectId(req.user.id) },
-        { $set: { plan: "pro" } },
-      );
+      .updateOne({ _id: new ObjectId(req.user.id) }, { $set: { plan: "pro" } });
 
     // ---------- 10) answer the success page ----------
     return res.json({

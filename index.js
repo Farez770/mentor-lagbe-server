@@ -315,7 +315,10 @@ app.get("/api/tuitions", async (req, res) => {
 //   total      = every tuition this tutor ever posted
 //   approved   = approved + live (admin approves in Phase 5)
 //   pending    = waiting for admin approval
-//   applicants = students who applied (0 until Phase 3)
+//   applicants = REAL count of applications received
+//                (FIXED 2026-11-21: this used to be a
+//                hardcoded 0 with a TODO — it now counts the
+//                "applications" collection for this tutor)
 // ============================================================
 app.get("/api/tuitions/stats", verifyToken, async (req, res) => {
   try {
@@ -341,9 +344,14 @@ app.get("/api/tuitions/stats", verifyToken, async (req, res) => {
       approvalStatus: "pending",
     });
 
-    // TODO (Phase 3): count real applications from the
-    // "applications" collection once students can apply
-    const applicants = 0;
+    // REAL applicant count: every application that arrived on
+    // ANY of this tutor's tuition posts. POST /api/applications
+    // stores tutorId on each row (a snapshot of the tuition's
+    // owner), so ONE countDocuments query answers this — no
+    // join needed.
+    const applicants = await db
+      .collection("applications")
+      .countDocuments({ tutorId: postedBy });
 
     return res.json({ total, approved, pending, applicants });
   } catch (err) {
@@ -562,11 +570,10 @@ app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
 // from the form; studentId comes from the session so duplicate
 // applications can be detected.
 app.post("/api/applications", verifyToken, async (req, res) => {
-  // PRIORITY BOOKING (Pro Student Plan): free students are NOT
-  // limited here — every student may apply as often as allowed
-  // by the tuition list. What Pro students get is ORDER: their
-  // applications are listed first in GET /api/applications/tutor
-  // (the tutor's Manage Applicants page), see the sort there.
+  // NOTE: the old "PRIORITY BOOKING" comment that lived here was
+  // removed because the requirement changed — the Pro Student
+  // benefit is now "unlimited bookmarks" (see /api/bookmarks),
+  // not application ordering. Applying rules are unchanged.
   try {
     // ==========================================================
     // ROLE RULE (project requirement): ONLY students may apply.
@@ -665,13 +672,18 @@ app.post("/api/applications", verifyToken, async (req, res) => {
 
 // ============================================================
 // GET /api/applications/tutor — EVERY application that arrived
-// on this tutor's tuition posts.
+// on this tutor's tuition posts (newest first).
 //
-// PRIORITY BOOKING (project requirement: "Pro Student Plan $10
-// for priority booking"): applications from Pro students
-// (users.plan === "pro") are returned FIRST, the rest follows
-// newest-first. The plan is joined live from the users
-// collection, so a fresh Pro upgrade shows up immediately.
+// ★ REQUIREMENT UPDATE (2026-11-21): the old Pro Student
+//   benefit "priority booking" (Pro students' applications
+//   listed FIRST) was REPLACED by the new requirement
+//   "Free students can bookmark 5 tuitions, Pro students can
+//   bookmark unlimited tuitions". Because the benefit changed,
+//   the priority-sort code below is COMMENTED OUT — the list
+//   is plain newest-first for everyone now. The bookmark
+//   system lives in /api/bookmarks further down. If the old
+//   requirement ever comes back, uncomment block (a) and
+//   delete block (b).
 // ============================================================
 app.get("/api/applications/tutor", verifyToken, async (req, res) => {
   try {
@@ -681,41 +693,42 @@ app.get("/api/applications/tutor", verifyToken, async (req, res) => {
         .json({ message: "Only tutors can view applicants" });
     }
 
-    // ---------- 1) all applications on my tuitions, newest first ----------
+    // ---------- (b) ACTIVE: plain newest-first list ----------
     const applications = await db
       .collection("applications")
       .find({ tutorId: req.user.id })
-      .sort({ createdAt: -1 }) // newest first (used inside each group)
+      .sort({ createdAt: -1 }) // newest first
       .toArray();
 
-    if (applications.length === 0) {
-      return res.json({ applications: [] }); // nothing to join
-    }
+    // turn every _id into a normal "id" field
+    const list = applications.map(({ _id, ...rest }) => ({
+      ...rest,
+      id: String(_id),
+    }));
 
-    // ---------- 2) join each student's PLAN (ONE query) ----------
-    // applications store studentId as a plain string id — collect
-    // the unique ones, keep valid 24-hex ids, fetch in one go
-    // (same trick as the admin transactions endpoint).
+    return res.json({ applications: list });
+
+    /* ---------- (a) COMMENTED OUT: priority booking ----------
+    // PRIORITY BOOKING (old requirement, disabled): join each
+    // student's plan so Pro rows can be returned first.
     const studentIds = [
       ...new Set(applications.map((a) => String(a.studentId))),
-    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id));
     const students =
       studentIds.length > 0
         ? await db
             .collection("users")
             .find(
               { _id: { $in: studentIds.map((id) => new ObjectId(id)) } },
-              { projection: { plan: 1 } }, // only what we need
+              { projection: { plan: 1 } },
             )
             .toArray()
         : [];
     const planById = new Map(students.map((u) => [String(u._id), u.plan]));
 
-    // ---------- 3) attach studentPlan to every row ----------
     const withPlan = applications.map(({ _id, ...rest }) => ({
-      ...rest, // studentName, studentEmail, status, tuitionTitle, ...
+      ...rest,
       id: String(_id),
-      // "pro" only when the account really is Pro, else "free"
       studentPlan:
         String(planById.get(String(rest.studentId)) || "free").toLowerCase() ===
         "pro"
@@ -723,13 +736,11 @@ app.get("/api/applications/tutor", verifyToken, async (req, res) => {
           : "free",
     }));
 
-    // ---------- 4) PRIORITY BOOKING: Pro students first ----------
-    // A stable partition: Pro rows keep their newest-first order,
-    // free rows keep theirs, Pro rows simply come out on top.
+    // stable partition: Pro rows first, free rows after
     const priority = withPlan.filter((a) => a.studentPlan === "pro");
     const regular = withPlan.filter((a) => a.studentPlan !== "pro");
-
     return res.json({ applications: [...priority, ...regular] });
+    -------------------------------------------------------- */
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });
@@ -954,6 +965,219 @@ app.delete("/api/applications/:id", verifyToken, async (req, res) => {
     await db.collection("applications").deleteOne({ _id: new ObjectId(id) });
 
     return res.json({ message: "Application cancelled" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// ============================================================
+// BOOKMARKS — NEW requirement (2026-11-21):
+//   "Free Students can bookmark 5 tuitions;
+//    Pro Students can bookmark unlimited tuitions."
+//
+// A bookmark is one row in the "bookmarks" collection:
+//   { userId, tuitionId, createdAt }
+// Only STUDENTS may bookmark (same role rule as applying).
+// The limit is enforced HERE on the server — the UI shows a
+// friendly toast with this same message, but never trusts
+// itself for the count.
+// ============================================================
+
+// The free-plan bookmark cap (Pro = no cap at all)
+const FREE_BOOKMARK_LIMIT = 5;
+
+// GET /api/bookmarks — MY bookmarked tuitions (student only),
+// newest first, each joined with its tuition so the "My
+// Bookmarks" page can render cards in ONE request.
+// Also returns count + limit so the page can show
+// "3 of 5 bookmarks used" (free) or "Unlimited" (pro).
+app.get("/api/bookmarks", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "student") {
+      return res
+        .status(403)
+        .json({ message: "Only students can view bookmarks" });
+    }
+
+    const bookmarks = await db
+      .collection("bookmarks")
+      .find({ userId: req.user.id })
+      .sort({ createdAt: -1 }) // newest first
+      .toArray();
+
+    // Join the tuition data (ONE query, same trick as
+    // /api/applications/mine). A deleted tuition simply shows
+    // as null and the UI hides that row's details.
+    const tuitionIds = bookmarks
+      .map((b) => b.tuitionId)
+      .filter((id) => /^[0-9a-fA-F]{24}$/.test(id));
+    const tuitions =
+      tuitionIds.length > 0
+        ? await db
+            .collection("tuitions")
+            .find({ _id: { $in: tuitionIds.map((id) => new ObjectId(id)) } })
+            .toArray()
+        : [];
+    const tuitionById = new Map(
+      tuitions.map((t) => [String(t._id), t]),
+    );
+
+    const list = bookmarks.map((b) => {
+      const t = tuitionById.get(b.tuitionId);
+      return {
+        id: String(b._id),
+        tuitionId: b.tuitionId,
+        bookmarkedAt: b.createdAt,
+        // the tuition itself (null when it was deleted later)
+        tuition: t
+          ? {
+              id: String(t._id),
+              title: t.title,
+              subject: t.subject,
+              classLevel: t.classLevel,
+              mode: t.mode,
+              fee: t.fee,
+              image: t.image,
+              tutorName: t.tutorName,
+              approvalStatus: t.approvalStatus,
+              isActive: t.isActive,
+            }
+          : null,
+      };
+    });
+
+    const isPro =
+      String(req.user.plan || "free").toLowerCase() === "pro";
+
+    return res.json({
+      bookmarks: list,
+      count: list.length,
+      // null = unlimited (Pro); 5 = the free-plan cap
+      limit: isPro ? null : FREE_BOOKMARK_LIMIT,
+      plan: isPro ? "pro" : "free",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// GET /api/bookmarks/check/:tuitionId — is THIS tuition
+// bookmarked by me? (the View Details page uses it to pick
+// between "Bookmark" and "Bookmarked ✓")
+app.get("/api/bookmarks/check/:tuitionId", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "student") {
+      return res.status(403).json({ message: "Only students can bookmark" });
+    }
+
+    const existing = await db.collection("bookmarks").findOne({
+      userId: req.user.id,
+      tuitionId: req.params.tuitionId,
+    });
+
+    return res.json({ bookmarked: !!existing });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// POST /api/bookmarks — SAVE a tuition (student only).
+// Rules enforced in order:
+//   1. only students (403)
+//   2. valid + existing tuition id (404)
+//   3. not already bookmarked (400)
+//   4. FREE plan stops at 5 bookmarks (403) — Pro is unlimited
+app.post("/api/bookmarks", verifyToken, async (req, res) => {
+  try {
+    // ---------- 1) role rule: students only ----------
+    if (req.user.role !== "student") {
+      return res
+        .status(403)
+        .json({ message: "Only students can bookmark tuitions" });
+    }
+
+    const { tuitionId } = req.body || {};
+    if (typeof tuitionId !== "string" || !/^[0-9a-fA-F]{24}$/.test(tuitionId)) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+
+    // ---------- 2) the tuition must exist ----------
+    const tuition = await db
+      .collection("tuitions")
+      .findOne({ _id: new ObjectId(tuitionId) });
+    if (!tuition) {
+      return res.status(404).json({ message: "Tuition not found" });
+    }
+
+    // ---------- 3) no duplicates ----------
+    const already = await db.collection("bookmarks").findOne({
+      userId: req.user.id,
+      tuitionId,
+    });
+    if (already) {
+      return res
+        .status(400)
+        .json({ message: "You already bookmarked this tuition" });
+    }
+
+    // ---------- 4) the PLAN LIMIT (the new requirement) ----------
+    const isPro =
+      String(req.user.plan || "free").toLowerCase() === "pro";
+    if (!isPro) {
+      const count = await db
+        .collection("bookmarks")
+        .countDocuments({ userId: req.user.id });
+      if (count >= FREE_BOOKMARK_LIMIT) {
+        return res.status(403).json({
+          message: `Free plan allows up to ${FREE_BOOKMARK_LIMIT} bookmarks. Upgrade to Pro for unlimited bookmarks`,
+        });
+      }
+    }
+
+    // ---------- 5) save ----------
+    const bookmark = {
+      userId: req.user.id, // from the session, not the body
+      tuitionId,
+      createdAt: new Date(),
+    };
+    const result = await db
+      .collection("bookmarks")
+      .insertOne(bookmark);
+
+    return res.status(201).json({
+      message: "Tuition bookmarked!",
+      bookmark: { ...bookmark, id: String(result.insertedId) },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong on the server" });
+  }
+});
+
+// DELETE /api/bookmarks/:tuitionId — REMOVE a bookmark
+// (the student's own row; other people's rows are untouched
+// because the filter always includes MY userId).
+app.delete("/api/bookmarks/:tuitionId", verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "student") {
+      return res
+        .status(403)
+        .json({ message: "Only students can manage bookmarks" });
+    }
+
+    const result = await db.collection("bookmarks").deleteOne({
+      userId: req.user.id,
+      tuitionId: req.params.tuitionId,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Bookmark not found" });
+    }
+
+    return res.json({ message: "Bookmark removed" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });

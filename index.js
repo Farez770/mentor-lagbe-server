@@ -4,6 +4,10 @@ import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import Stripe from "stripe"; // official Stripe SDK (only the payments route uses it)
+// ★ REQUIREMENT UPDATE (JWT): `jose` verifies the signed JWT issued by
+// Better Auth. We fetch the public keys from Better Auth's JWKS endpoint
+// and cache them in memory, so we never need the private signing key here.
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -24,6 +28,17 @@ export async function connectToMongoDB() {
 const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("mentor-lagbe");
 
+// ★ REQUIREMENT UPDATE (JWT):
+// The Better Auth server lives in the NEXT.js client repo, so the Express
+// API verifies JWTs through its public JWKS URL. `CLIENT_URL` is kept as a
+// fallback so older .env files still work.
+const CLIENT_URL = (process.env.CLIENT_URL || "http://localhost:3000").replace(
+  /\/$/,
+  "",
+);
+
+const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
+
 // ============================================================
 // Stripe client — used ONLY by /api/payments/verify.
 // The secret key lives in .env (same test key as the client's
@@ -39,50 +54,45 @@ app.get("/", (req, res) => {
 });
 
 // ============================================================
-// verifyToken — our login check (middleware)
+// ★ REQUIREMENT UPDATE (JWT): verifyToken is now a REAL JWT middleware.
 //
-// The browser sends every protected request with this header:
-//     Authorization:  Bearer <session token>
+// The browser sends every protected request with:
+//     Authorization:  Bearer <jwt>
 //
-// BetterAuth saves that exact token in MongoDB, inside the
-// "session" collection. So here we simply:
-//   1. take the token from the header
-//   2. find it in the "session" collection
-//   3. make sure it is not expired
-//   4. load the user behind the session ("users" collection)
+// We no longer look up a MongoDB `session` token. Instead:
+//   1. take the JWT from the header
+//   2. verify its signature + expiry against Better Auth's JWKS
+//   3. read the user id from the verified `sub` claim
+//   4. load the FRESH user from MongoDB (role/plan can change)
 //   5. attach that user to the request (req.user)
+//
+// Loading the user again after verification is deliberate: a JWT might
+// contain an old role, but MongoDB always has the current truth.
 // ============================================================
 async function verifyToken(req, res, next) {
   try {
-    // --- 1) read the token from the header ---
+    // --- 1) read the JWT from the header ---
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      // return res.status(401).json({ message: "You are not signed in" });
       return res.status(401).send({ message: "Unauthorized" });
     }
     const token = authHeader.slice(7); // remove "Bearer "
 
-    console.log(token);
+    // --- 2) verify signature, expiry, issuer and audience ---
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: CLIENT_URL,
+      audience: CLIENT_URL,
+    });
 
-    // --- 2) find the session in MongoDB ---
-    const session = await db.collection("session").findOne({ token });
-    if (!session) {
+    // --- 3) the user id lives in the standard `sub` claim ---
+    if (!payload.sub) {
       return res.status(401).send({ message: "Unauthorized" });
-      // return res
-      //   .status(401)
-      //   .send({ message: "Session expired. Please sign in again" });
     }
 
-    // --- 3) is the session still valid? ---
-    if (new Date(session.expiresAt) < new Date()) {
-      return res.status(401).send({ message: "Unauthorized" });
-      // return res
-      //   .status(401)
-      //   .send({ message: "Session expired. Please sign in again" });
-    }
-
-    // --- 4) load the user behind this session ---
-    const user = await db.collection("users").findOne({ _id: session.userId });
+    // --- 4) load the fresh user from MongoDB ---
+    const user = await db
+      .collection("users")
+      .findOne({ _id: new ObjectId(payload.sub) });
     if (!user) {
       return res.status(401).send({ message: "User not found" });
     }
@@ -93,19 +103,24 @@ async function verifyToken(req, res, next) {
       name: user.name,
       email: user.email,
       image: user.image || "",
-      role: user.role || "student", // "student" | "tutor"
+      role: user.role || "student", // "student" | "tutor" | "admin"
       plan: user.plan || "free", // "free" | "pro"
     };
+    // The verified JWT claims are also available if a route needs them.
+    req.jwtPayload = payload;
 
     next();
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Something went wrong on the server" });
+    // Bad/expired/forged JWTs are auth failures, not server crashes.
+    console.error("JWT verification failed:", err?.message ?? err);
+    return res.status(401).send({ message: "Unauthorized" });
   }
 }
 
+// ★ REQUIREMENT UPDATE: custom Express role middlewares. They always run
+// after verifyToken, so req.user is guaranteed to exist here.
 const verifyStudent = async (req, res, next) => {
-  if (req.user.role !== "student") {
+  if (!req.user || req.user.role !== "student") {
     res.status(403).send({ message: "Forbidden" });
     return;
   }
@@ -113,7 +128,7 @@ const verifyStudent = async (req, res, next) => {
 };
 
 const verifyTutor = async (req, res, next) => {
-  if (req.user.role !== "tutor") {
+  if (!req.user || req.user.role !== "tutor") {
     res.status(403).send({ message: "Forbidden" });
     return;
   }
@@ -121,7 +136,7 @@ const verifyTutor = async (req, res, next) => {
 };
 
 const verifyAdmin = async (req, res, next) => {
-  if (req.user.role !== "admin") {
+  if (!req.user || req.user.role !== "admin") {
     res.status(403).send({ message: "Forbidden" });
     return;
   }
@@ -803,7 +818,7 @@ app.get(
           .json({ message: "Only students can view application stats" });
       }
 
-      const studentId = req.user.id; // comes from the session token
+      const studentId = req.user.id; // ★ JWT: comes from the verified token
 
       // Three simple counting queries (clearer than an aggregation
       // pipeline for beginners — this collection stays small)

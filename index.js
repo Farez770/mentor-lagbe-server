@@ -1,9 +1,8 @@
 // Load the .env file first so process.env.MONGODB_URI / PORT work
-import "dotenv/config";
-
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
+import "dotenv/config";
 import Stripe from "stripe"; // official Stripe SDK (only the payments route uses it)
 
 const app = express();
@@ -58,29 +57,34 @@ async function verifyToken(req, res, next) {
     // --- 1) read the token from the header ---
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ message: "You are not signed in" });
+      // return res.status(401).json({ message: "You are not signed in" });
+      return res.status(401).send({ message: "Unauthorized" });
     }
     const token = authHeader.slice(7); // remove "Bearer "
+
+    console.log(token);
 
     // --- 2) find the session in MongoDB ---
     const session = await db.collection("session").findOne({ token });
     if (!session) {
-      return res
-        .status(401)
-        .json({ message: "Session expired. Please sign in again" });
+      return res.status(401).send({ message: "Unauthorized" });
+      // return res
+      //   .status(401)
+      //   .send({ message: "Session expired. Please sign in again" });
     }
 
     // --- 3) is the session still valid? ---
     if (new Date(session.expiresAt) < new Date()) {
-      return res
-        .status(401)
-        .json({ message: "Session expired. Please sign in again" });
+      return res.status(401).send({ message: "Unauthorized" });
+      // return res
+      //   .status(401)
+      //   .send({ message: "Session expired. Please sign in again" });
     }
 
     // --- 4) load the user behind this session ---
     const user = await db.collection("users").findOne({ _id: session.userId });
     if (!user) {
-      return res.status(401).json({ message: "User not found" });
+      return res.status(401).send({ message: "User not found" });
     }
 
     // --- 5) every route below can now read req.user ---
@@ -96,9 +100,33 @@ async function verifyToken(req, res, next) {
     next();
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
+    res.status(500).send({ message: "Something went wrong on the server" });
   }
 }
+
+const verifyStudent = async (req, res, next) => {
+  if (req.user.role !== "student") {
+    res.status(403).send({ message: "Forbidden" });
+    return;
+  }
+  next();
+};
+
+const verifyTutor = async (req, res, next) => {
+  if (req.user.role !== "tutor") {
+    res.status(403).send({ message: "Forbidden" });
+    return;
+  }
+  next();
+};
+
+const verifyAdmin = async (req, res, next) => {
+  if (req.user.role !== "admin") {
+    res.status(403).send({ message: "Forbidden" });
+    return;
+  }
+  next();
+};
 
 // ============================================================
 // validateTuition — the rules every tuition must pass.
@@ -160,7 +188,7 @@ function validateTuition(body) {
 //   - Free plan  -> max 2 tuition posts
 //   - Pro plan   -> unlimited posts
 // ============================================================
-app.post("/api/tuitions", verifyToken, async (req, res) => {
+app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res) => {
   try {
     // Only tutors may post
     if (req.user.role !== "tutor") {
@@ -246,7 +274,7 @@ app.post("/api/tuitions", verifyToken, async (req, res) => {
 // GET /api/tuitions/mine — the logged-in tutor's own tuitions
 // (the form uses it for the "X of 2 posts used" counter)
 // ============================================================
-app.get("/api/tuitions/mine", verifyToken, async (req, res) => {
+app.get("/api/tuitions/mine", verifyToken, verifyTutor, async (req, res) => {
   try {
     if (req.user.role !== "tutor") {
       return res
@@ -320,7 +348,7 @@ app.get("/api/tuitions", async (req, res) => {
 //                hardcoded 0 with a TODO — it now counts the
 //                "applications" collection for this tutor)
 // ============================================================
-app.get("/api/tuitions/stats", verifyToken, async (req, res) => {
+app.get("/api/tuitions/stats", verifyToken, verifyTutor, async (req, res) => {
   try {
     // Only tutors have a dashboard with these numbers
     if (req.user.role !== "tutor") {
@@ -437,7 +465,7 @@ async function getOwnedTuition(req, res) {
 // Only the form fields change. approvalStatus is NEVER touched
 // here — only the admin approves / rejects a post.
 // ============================================================
-app.patch("/api/tuitions/:id", verifyToken, async (req, res) => {
+app.patch("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
   try {
     if (req.user.role !== "tutor") {
       return res.status(403).json({ message: "Only tutors can edit tuitions" });
@@ -500,42 +528,47 @@ app.patch("/api/tuitions/:id", verifyToken, async (req, res) => {
 //
 // The server simply flips the current isActive value.
 // ============================================================
-app.patch("/api/tuitions/:id/toggle", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "tutor") {
-      return res
-        .status(403)
-        .json({ message: "Only tutors can change tuition status" });
+app.patch(
+  "/api/tuitions/:id/toggle",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "tutor") {
+        return res
+          .status(403)
+          .json({ message: "Only tutors can change tuition status" });
+      }
+
+      const tuition = await getOwnedTuition(req, res);
+      if (!tuition) return; // error response already sent
+
+      const newActive = !tuition.isActive; // flip it
+
+      await db
+        .collection("tuitions")
+        .updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { isActive: newActive } },
+        );
+
+      const { _id, ...rest } = { ...tuition, isActive: newActive };
+      return res.json({
+        message: newActive ? "Tuition is now active" : "Tuition closed",
+        tuition: { ...rest, id: String(_id) },
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    const tuition = await getOwnedTuition(req, res);
-    if (!tuition) return; // error response already sent
-
-    const newActive = !tuition.isActive; // flip it
-
-    await db
-      .collection("tuitions")
-      .updateOne(
-        { _id: new ObjectId(req.params.id) },
-        { $set: { isActive: newActive } },
-      );
-
-    const { _id, ...rest } = { ...tuition, isActive: newActive };
-    return res.json({
-      message: newActive ? "Tuition is now active" : "Tuition closed",
-      tuition: { ...rest, id: String(_id) },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // DELETE /api/tuitions/:id — remove a tuition post forever
 // (My Tuitions page -> Delete button)
 // ============================================================
-app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
+app.delete("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
   try {
     if (req.user.role !== "tutor") {
       return res
@@ -569,7 +602,7 @@ app.delete("/api/tuitions/:id", verifyToken, async (req, res) => {
 // platform could restrict this later). Name/email/phone come
 // from the form; studentId comes from the session so duplicate
 // applications can be detected.
-app.post("/api/applications", verifyToken, async (req, res) => {
+app.post("/api/applications", verifyToken, verifyStudent, async (req, res) => {
   // NOTE: the old "PRIORITY BOOKING" comment that lived here was
   // removed because the requirement changed — the Pro Student
   // benefit is now "unlimited bookmarks" (see /api/bookmarks),
@@ -685,30 +718,34 @@ app.post("/api/applications", verifyToken, async (req, res) => {
 //   requirement ever comes back, uncomment block (a) and
 //   delete block (b).
 // ============================================================
-app.get("/api/applications/tutor", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "tutor") {
-      return res
-        .status(403)
-        .json({ message: "Only tutors can view applicants" });
-    }
+app.get(
+  "/api/applications/tutor",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "tutor") {
+        return res
+          .status(403)
+          .json({ message: "Only tutors can view applicants" });
+      }
 
-    // ---------- (b) ACTIVE: plain newest-first list ----------
-    const applications = await db
-      .collection("applications")
-      .find({ tutorId: req.user.id })
-      .sort({ createdAt: -1 }) // newest first
-      .toArray();
+      // ---------- (b) ACTIVE: plain newest-first list ----------
+      const applications = await db
+        .collection("applications")
+        .find({ tutorId: req.user.id })
+        .sort({ createdAt: -1 }) // newest first
+        .toArray();
 
-    // turn every _id into a normal "id" field
-    const list = applications.map(({ _id, ...rest }) => ({
-      ...rest,
-      id: String(_id),
-    }));
+      // turn every _id into a normal "id" field
+      const list = applications.map(({ _id, ...rest }) => ({
+        ...rest,
+        id: String(_id),
+      }));
 
-    return res.json({ applications: list });
+      return res.json({ applications: list });
 
-    /* ---------- (a) COMMENTED OUT: priority booking ----------
+      /* ---------- (a) COMMENTED OUT: priority booking ----------
     // PRIORITY BOOKING (old requirement, disabled): join each
     // student's plan so Pro rows can be returned first.
     const studentIds = [
@@ -741,11 +778,12 @@ app.get("/api/applications/tutor", verifyToken, async (req, res) => {
     const regular = withPlan.filter((a) => a.studentPlan !== "pro");
     return res.json({ applications: [...priority, ...regular] });
     -------------------------------------------------------- */
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
+    }
+  },
+);
 
 // ============================================================
 // GET /api/applications/stats — MY application numbers for
@@ -753,41 +791,46 @@ app.get("/api/applications/tutor", verifyToken, async (req, res) => {
 //   Total Applied Tuitions / Accepted / Pending + my plan
 // (student role only — mirrors GET /api/tuitions/stats)
 // ============================================================
-app.get("/api/applications/stats", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "student") {
-      return res
-        .status(403)
-        .json({ message: "Only students can view application stats" });
+app.get(
+  "/api/applications/stats",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res
+          .status(403)
+          .json({ message: "Only students can view application stats" });
+      }
+
+      const studentId = req.user.id; // comes from the session token
+
+      // Three simple counting queries (clearer than an aggregation
+      // pipeline for beginners — this collection stays small)
+      const totalApplied = await db
+        .collection("applications")
+        .countDocuments({ studentId });
+      const accepted = await db
+        .collection("applications")
+        .countDocuments({ studentId, status: "accepted" });
+      const pending = await db
+        .collection("applications")
+        .countDocuments({ studentId, status: "pending" });
+
+      return res.json({
+        stats: {
+          totalApplied,
+          accepted,
+          pending,
+          plan: req.user.plan || "free", // "free" | "pro"
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    const studentId = req.user.id; // comes from the session token
-
-    // Three simple counting queries (clearer than an aggregation
-    // pipeline for beginners — this collection stays small)
-    const totalApplied = await db
-      .collection("applications")
-      .countDocuments({ studentId });
-    const accepted = await db
-      .collection("applications")
-      .countDocuments({ studentId, status: "accepted" });
-    const pending = await db
-      .collection("applications")
-      .countDocuments({ studentId, status: "pending" });
-
-    return res.json({
-      stats: {
-        totalApplied,
-        accepted,
-        pending,
-        plan: req.user.plan || "free", // "free" | "pro"
-      },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // GET /api/applications/mine — EVERY application I have sent
@@ -798,178 +841,195 @@ app.get("/api/applications/stats", verifyToken, async (req, res) => {
 // first query we JOIN the extra data in two more simple queries
 // (tuitions, then users). This also survives a deleted tuition.
 // ============================================================
-app.get("/api/applications/mine", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "student") {
-      return res
-        .status(403)
-        .json({ message: "Only students can view their applications" });
+app.get(
+  "/api/applications/mine",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res
+          .status(403)
+          .json({ message: "Only students can view their applications" });
+      }
+
+      // ---------- 1) my applications, newest first ----------
+      const applications = await db
+        .collection("applications")
+        .find({ studentId: req.user.id })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      if (applications.length === 0) {
+        return res.json({ applications: [] }); // nothing to join
+      }
+
+      // ---------- 2) the tuitions I applied to (ONE query) ----------
+      // tuitionId was validated as a 24-hex string when saved
+      const tuitionIds = applications.map((a) => a.tuitionId);
+      const tuitions = await db
+        .collection("tuitions")
+        .find({ _id: { $in: tuitionIds.map((id) => new ObjectId(id)) } })
+        .toArray();
+      const tuitionById = new Map(tuitions.map((t) => [String(t._id), t]));
+
+      // ---------- 3) the tutors' emails (ONE query) ----------
+      // tuitions only store postedBy (the user id), not the email
+      const tutorIds = [
+        ...new Set(tuitions.map((t) => String(t.postedBy))),
+      ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
+      const tutors =
+        tutorIds.length > 0
+          ? await db
+              .collection("users")
+              .find({ _id: { $in: tutorIds.map((id) => new ObjectId(id)) } })
+              .toArray()
+          : [];
+      const tutorById = new Map(tutors.map((u) => [String(u._id), u]));
+
+      // ---------- 4) merge everything into one flat row ----------
+      const list = applications.map((a) => {
+        const tuition = tuitionById.get(a.tuitionId); // may be undefined
+        const tutor = tuition
+          ? tutorById.get(String(tuition.postedBy))
+          : undefined;
+
+        return {
+          id: String(a._id),
+          tuitionId: a.tuitionId,
+          // live title/fee when the post still exists, otherwise
+          // the snapshot saved on the application / a placeholder
+          tuitionTitle: tuition?.title ?? a.tuitionTitle,
+          tutorName: tuition?.tutorName ?? "(unknown tutor)",
+          tutorEmail: tutor?.email ?? "(unknown email)",
+          fee: typeof tuition?.fee === "number" ? tuition.fee : null,
+          appliedAt: a.createdAt,
+          status: a.status, // pending | accepted | rejected
+        };
+      });
+
+      return res.json({ applications: list });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    // ---------- 1) my applications, newest first ----------
-    const applications = await db
-      .collection("applications")
-      .find({ studentId: req.user.id })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    if (applications.length === 0) {
-      return res.json({ applications: [] }); // nothing to join
-    }
-
-    // ---------- 2) the tuitions I applied to (ONE query) ----------
-    // tuitionId was validated as a 24-hex string when saved
-    const tuitionIds = applications.map((a) => a.tuitionId);
-    const tuitions = await db
-      .collection("tuitions")
-      .find({ _id: { $in: tuitionIds.map((id) => new ObjectId(id)) } })
-      .toArray();
-    const tuitionById = new Map(tuitions.map((t) => [String(t._id), t]));
-
-    // ---------- 3) the tutors' emails (ONE query) ----------
-    // tuitions only store postedBy (the user id), not the email
-    const tutorIds = [
-      ...new Set(tuitions.map((t) => String(t.postedBy))),
-    ].filter((id) => /^[0-9a-fA-F]{24}$/.test(id)); // safety first
-    const tutors =
-      tutorIds.length > 0
-        ? await db
-            .collection("users")
-            .find({ _id: { $in: tutorIds.map((id) => new ObjectId(id)) } })
-            .toArray()
-        : [];
-    const tutorById = new Map(tutors.map((u) => [String(u._id), u]));
-
-    // ---------- 4) merge everything into one flat row ----------
-    const list = applications.map((a) => {
-      const tuition = tuitionById.get(a.tuitionId); // may be undefined
-      const tutor = tuition
-        ? tutorById.get(String(tuition.postedBy))
-        : undefined;
-
-      return {
-        id: String(a._id),
-        tuitionId: a.tuitionId,
-        // live title/fee when the post still exists, otherwise
-        // the snapshot saved on the application / a placeholder
-        tuitionTitle: tuition?.title ?? a.tuitionTitle,
-        tutorName: tuition?.tutorName ?? "(unknown tutor)",
-        tutorEmail: tutor?.email ?? "(unknown email)",
-        fee: typeof tuition?.fee === "number" ? tuition.fee : null,
-        appliedAt: a.createdAt,
-        status: a.status, // pending | accepted | rejected
-      };
-    });
-
-    return res.json({ applications: list });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // PATCH /api/applications/:id — the tutor moves ONE application
 // to "accepted" or "rejected" (the status update from the
 // requirement). Only the tutor who owns the tuition may decide.
 // ============================================================
-app.patch("/api/applications/:id", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "tutor") {
-      return res
-        .status(403)
-        .json({ message: "Only tutors can review applicants" });
-    }
+app.patch(
+  "/api/applications/:id",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "tutor") {
+        return res
+          .status(403)
+          .json({ message: "Only tutors can review applicants" });
+      }
 
-    const { id } = req.params;
-    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
-      return res.status(404).json({ message: "Application not found" });
-    }
+      const { id } = req.params;
+      if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+        return res.status(404).json({ message: "Application not found" });
+      }
 
-    const application = await db
-      .collection("applications")
-      .findOne({ _id: new ObjectId(id) });
-    if (!application) {
-      return res.status(404).json({ message: "Application not found" });
-    }
+      const application = await db
+        .collection("applications")
+        .findOne({ _id: new ObjectId(id) });
+      if (!application) {
+        return res.status(404).json({ message: "Application not found" });
+      }
 
-    // ownership: this application belongs to one of MY tuitions
-    if (application.tutorId !== req.user.id) {
-      return res.status(403).json({
-        message: "You can only review applications to your own tuitions",
+      // ownership: this application belongs to one of MY tuitions
+      if (application.tutorId !== req.user.id) {
+        return res.status(403).json({
+          message: "You can only review applications to your own tuitions",
+        });
+      }
+
+      const { status } = req.body || {};
+      if (status !== "accepted" && status !== "rejected") {
+        return res
+          .status(400)
+          .json({ message: "Status must be accepted or rejected" });
+      }
+
+      await db
+        .collection("applications")
+        .updateOne({ _id: new ObjectId(id) }, { $set: { status } });
+
+      const { _id, ...rest } = application;
+      return res.json({
+        message:
+          status === "accepted"
+            ? "Application accepted"
+            : "Application rejected",
+        application: { ...rest, status, id: String(_id) },
       });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    const { status } = req.body || {};
-    if (status !== "accepted" && status !== "rejected") {
-      return res
-        .status(400)
-        .json({ message: "Status must be accepted or rejected" });
-    }
-
-    await db
-      .collection("applications")
-      .updateOne({ _id: new ObjectId(id) }, { $set: { status } });
-
-    const { _id, ...rest } = application;
-    return res.json({
-      message:
-        status === "accepted" ? "Application accepted" : "Application rejected",
-      application: { ...rest, status, id: String(_id) },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // DELETE /api/applications/:id — the student CANCELS one of
 // their OWN applications, but only while it is still pending
 // (once the tutor decided, the row stays as a record).
 // ============================================================
-app.delete("/api/applications/:id", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "student") {
-      return res
-        .status(403)
-        .json({ message: "Only students can cancel applications" });
+app.delete(
+  "/api/applications/:id",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res
+          .status(403)
+          .json({ message: "Only students can cancel applications" });
+      }
+
+      const { id } = req.params;
+      if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+
+      const application = await db
+        .collection("applications")
+        .findOne({ _id: new ObjectId(id) });
+      if (!application) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+
+      // ownership: only the student who SENT it may cancel it
+      if (application.studentId !== req.user.id) {
+        return res.status(403).json({
+          message: "You can only cancel your own applications",
+        });
+      }
+
+      // state rule: accepted / rejected rows can no longer be touched
+      if (application.status !== "pending") {
+        return res.status(409).json({
+          message: `Only pending applications can be cancelled — this one is already ${application.status}`,
+        });
+      }
+
+      await db.collection("applications").deleteOne({ _id: new ObjectId(id) });
+
+      return res.json({ message: "Application cancelled" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    const { id } = req.params;
-    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
-      return res.status(404).json({ message: "Application not found" });
-    }
-
-    const application = await db
-      .collection("applications")
-      .findOne({ _id: new ObjectId(id) });
-    if (!application) {
-      return res.status(404).json({ message: "Application not found" });
-    }
-
-    // ownership: only the student who SENT it may cancel it
-    if (application.studentId !== req.user.id) {
-      return res.status(403).json({
-        message: "You can only cancel your own applications",
-      });
-    }
-
-    // state rule: accepted / rejected rows can no longer be touched
-    if (application.status !== "pending") {
-      return res.status(409).json({
-        message: `Only pending applications can be cancelled — this one is already ${application.status}`,
-      });
-    }
-
-    await db.collection("applications").deleteOne({ _id: new ObjectId(id) });
-
-    return res.json({ message: "Application cancelled" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // BOOKMARKS — NEW requirement (2026-11-21):
@@ -992,7 +1052,7 @@ const FREE_BOOKMARK_LIMIT = 5;
 // Bookmarks" page can render cards in ONE request.
 // Also returns count + limit so the page can show
 // "3 of 5 bookmarks used" (free) or "Unlimited" (pro).
-app.get("/api/bookmarks", verifyToken, async (req, res) => {
+app.get("/api/bookmarks", verifyToken, verifyStudent, async (req, res) => {
   try {
     if (req.user.role !== "student") {
       return res
@@ -1019,9 +1079,7 @@ app.get("/api/bookmarks", verifyToken, async (req, res) => {
             .find({ _id: { $in: tuitionIds.map((id) => new ObjectId(id)) } })
             .toArray()
         : [];
-    const tuitionById = new Map(
-      tuitions.map((t) => [String(t._id), t]),
-    );
+    const tuitionById = new Map(tuitions.map((t) => [String(t._id), t]));
 
     const list = bookmarks.map((b) => {
       const t = tuitionById.get(b.tuitionId);
@@ -1047,8 +1105,7 @@ app.get("/api/bookmarks", verifyToken, async (req, res) => {
       };
     });
 
-    const isPro =
-      String(req.user.plan || "free").toLowerCase() === "pro";
+    const isPro = String(req.user.plan || "free").toLowerCase() === "pro";
 
     return res.json({
       bookmarks: list,
@@ -1066,23 +1123,28 @@ app.get("/api/bookmarks", verifyToken, async (req, res) => {
 // GET /api/bookmarks/check/:tuitionId — is THIS tuition
 // bookmarked by me? (the View Details page uses it to pick
 // between "Bookmark" and "Bookmarked ✓")
-app.get("/api/bookmarks/check/:tuitionId", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "student") {
-      return res.status(403).json({ message: "Only students can bookmark" });
+app.get(
+  "/api/bookmarks/check/:tuitionId",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res.status(403).json({ message: "Only students can bookmark" });
+      }
+
+      const existing = await db.collection("bookmarks").findOne({
+        userId: req.user.id,
+        tuitionId: req.params.tuitionId,
+      });
+
+      return res.json({ bookmarked: !!existing });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    const existing = await db.collection("bookmarks").findOne({
-      userId: req.user.id,
-      tuitionId: req.params.tuitionId,
-    });
-
-    return res.json({ bookmarked: !!existing });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // POST /api/bookmarks — SAVE a tuition (student only).
 // Rules enforced in order:
@@ -1090,7 +1152,7 @@ app.get("/api/bookmarks/check/:tuitionId", verifyToken, async (req, res) => {
 //   2. valid + existing tuition id (404)
 //   3. not already bookmarked (400)
 //   4. FREE plan stops at 5 bookmarks (403) — Pro is unlimited
-app.post("/api/bookmarks", verifyToken, async (req, res) => {
+app.post("/api/bookmarks", verifyToken, verifyStudent, async (req, res) => {
   try {
     // ---------- 1) role rule: students only ----------
     if (req.user.role !== "student") {
@@ -1124,8 +1186,7 @@ app.post("/api/bookmarks", verifyToken, async (req, res) => {
     }
 
     // ---------- 4) the PLAN LIMIT (the new requirement) ----------
-    const isPro =
-      String(req.user.plan || "free").toLowerCase() === "pro";
+    const isPro = String(req.user.plan || "free").toLowerCase() === "pro";
     if (!isPro) {
       const count = await db
         .collection("bookmarks")
@@ -1143,9 +1204,7 @@ app.post("/api/bookmarks", verifyToken, async (req, res) => {
       tuitionId,
       createdAt: new Date(),
     };
-    const result = await db
-      .collection("bookmarks")
-      .insertOne(bookmark);
+    const result = await db.collection("bookmarks").insertOne(bookmark);
 
     return res.status(201).json({
       message: "Tuition bookmarked!",
@@ -1160,29 +1219,34 @@ app.post("/api/bookmarks", verifyToken, async (req, res) => {
 // DELETE /api/bookmarks/:tuitionId — REMOVE a bookmark
 // (the student's own row; other people's rows are untouched
 // because the filter always includes MY userId).
-app.delete("/api/bookmarks/:tuitionId", verifyToken, async (req, res) => {
-  try {
-    if (req.user.role !== "student") {
-      return res
-        .status(403)
-        .json({ message: "Only students can manage bookmarks" });
+app.delete(
+  "/api/bookmarks/:tuitionId",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res
+          .status(403)
+          .json({ message: "Only students can manage bookmarks" });
+      }
+
+      const result = await db.collection("bookmarks").deleteOne({
+        userId: req.user.id,
+        tuitionId: req.params.tuitionId,
+      });
+
+      if (result.deletedCount === 0) {
+        return res.status(404).json({ message: "Bookmark not found" });
+      }
+
+      return res.json({ message: "Bookmark removed" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    const result = await db.collection("bookmarks").deleteOne({
-      userId: req.user.id,
-      tuitionId: req.params.tuitionId,
-    });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ message: "Bookmark not found" });
-    }
-
-    return res.json({ message: "Bookmark removed" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // PATCH /api/profile — update MY OWN profile.
@@ -1267,7 +1331,7 @@ app.patch("/api/profile", verifyToken, async (req, res) => {
 //   Total Users / Total Tutors / Pending vs. Approved Tuitions
 //   / Total Stripe Revenue
 // ============================================================
-app.get("/api/admin/stats", verifyToken, async (req, res) => {
+app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
   try {
     if (req.user.role !== "admin") {
       return res
@@ -1322,7 +1386,7 @@ app.get("/api/admin/stats", verifyToken, async (req, res) => {
 // secrets — passwords live in the separate "account" collection
 // and are never queried here).
 // ============================================================
-app.get("/api/admin/users", verifyToken, async (req, res) => {
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     // ---------- 1) only admins may see the full user list ----------
     if (req.user.role !== "admin") {
@@ -1376,69 +1440,76 @@ app.get("/api/admin/users", verifyToken, async (req, res) => {
 // PATCH /api/admin/users/:id — change ONE user's role
 // (student | tutor | admin). Admin role only.
 // ============================================================
-app.patch("/api/admin/users/:id", verifyToken, async (req, res) => {
-  try {
-    // ---------- 1) only admins may change roles ----------
-    if (req.user.role !== "admin") {
-      return res.status(403).json({ message: "Only admins can change roles" });
+app.patch(
+  "/api/admin/users/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      // ---------- 1) only admins may change roles ----------
+      if (req.user.role !== "admin") {
+        return res
+          .status(403)
+          .json({ message: "Only admins can change roles" });
+      }
+
+      // ---------- 2) validate the id format ----------
+      const { id } = req.params;
+      if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      // ---------- 3) validate the new role ----------
+      const { role } = req.body || {};
+      if (role !== "student" && role !== "tutor" && role !== "admin") {
+        return res
+          .status(400)
+          .json({ message: "Role must be student, tutor or admin" });
+      }
+
+      // ---------- 4) nobody may demote THEMSELVES ----------
+      // Without this an admin could remove their own "admin"
+      // role by accident and then nobody could manage users.
+      if (id === req.user.id) {
+        return res
+          .status(400)
+          .json({ message: "You cannot change your own role" });
+      }
+
+      // ---------- 5) the target user must exist ----------
+      const user = await db
+        .collection("users")
+        .findOne({ _id: new ObjectId(id) });
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      // ---------- 6) write the new role ----------
+      // verifyToken reads the role from the DB on every request,
+      // so the change takes effect immediately — no re-login.
+      await db
+        .collection("users")
+        .updateOne({ _id: new ObjectId(id) }, { $set: { role } });
+
+      // ---------- 7) answer with the updated row ----------
+      return res.json({
+        message: `${user.name || user.email} is now ${role}`,
+        user: {
+          id: String(user._id),
+          name: user.name || "",
+          email: user.email || "",
+          image: user.image || "",
+          role, // the NEW role
+          plan: user.plan || "free",
+          createdAt: user.createdAt || null,
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    // ---------- 2) validate the id format ----------
-    const { id } = req.params;
-    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    // ---------- 3) validate the new role ----------
-    const { role } = req.body || {};
-    if (role !== "student" && role !== "tutor" && role !== "admin") {
-      return res
-        .status(400)
-        .json({ message: "Role must be student, tutor or admin" });
-    }
-
-    // ---------- 4) nobody may demote THEMSELVES ----------
-    // Without this an admin could remove their own "admin"
-    // role by accident and then nobody could manage users.
-    if (id === req.user.id) {
-      return res
-        .status(400)
-        .json({ message: "You cannot change your own role" });
-    }
-
-    // ---------- 5) the target user must exist ----------
-    const user = await db
-      .collection("users")
-      .findOne({ _id: new ObjectId(id) });
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    // ---------- 6) write the new role ----------
-    // verifyToken reads the role from the DB on every request,
-    // so the change takes effect immediately — no re-login.
-    await db
-      .collection("users")
-      .updateOne({ _id: new ObjectId(id) }, { $set: { role } });
-
-    // ---------- 7) answer with the updated row ----------
-    return res.json({
-      message: `${user.name || user.email} is now ${role}`,
-      user: {
-        id: String(user._id),
-        name: user.name || "",
-        email: user.email || "",
-        image: user.image || "",
-        role, // the NEW role
-        plan: user.plan || "free",
-        createdAt: user.createdAt || null,
-      },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // GET /api/admin/tuitions — EVERY tuition post ever submitted
@@ -1447,7 +1518,7 @@ app.patch("/api/admin/users/:id", verifyToken, async (req, res) => {
 // (denormalized when posted), so we only join the tutor's
 // EMAIL from the users collection.
 // ============================================================
-app.get("/api/admin/tuitions", verifyToken, async (req, res) => {
+app.get("/api/admin/tuitions", verifyToken, verifyAdmin, async (req, res) => {
   try {
     // ---------- 1) only admins may review posts ----------
     if (req.user.role !== "admin") {
@@ -1504,59 +1575,64 @@ app.get("/api/admin/tuitions", verifyToken, async (req, res) => {
 // PATCH /api/admin/tuitions/:id — APPROVE or REJECT one post
 // (the Admin Tuition Approval Flow). Admin role only.
 // ============================================================
-app.patch("/api/admin/tuitions/:id", verifyToken, async (req, res) => {
-  try {
-    // ---------- 1) only admins may decide ----------
-    if (req.user.role !== "admin") {
-      return res
-        .status(403)
-        .json({ message: "Only admins can approve or reject tuitions" });
+app.patch(
+  "/api/admin/tuitions/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      // ---------- 1) only admins may decide ----------
+      if (req.user.role !== "admin") {
+        return res
+          .status(403)
+          .json({ message: "Only admins can approve or reject tuitions" });
+      }
+
+      // ---------- 2) validate the id format ----------
+      const { id } = req.params;
+      if (!/^[0-9a-fA-F]{24}$/.test(id)) {
+        return res.status(404).json({ message: "Tuition not found" });
+      }
+
+      // ---------- 3) validate the new status ----------
+      // Only the two decisions from the requirement are allowed
+      // (setting it back to "pending" is not part of the flow).
+      const { approvalStatus } = req.body || {};
+      if (approvalStatus !== "approved" && approvalStatus !== "rejected") {
+        return res
+          .status(400)
+          .json({ message: "approvalStatus must be approved or rejected" });
+      }
+
+      // ---------- 4) the post must exist ----------
+      const tuition = await db
+        .collection("tuitions")
+        .findOne({ _id: new ObjectId(id) });
+      if (!tuition) {
+        return res.status(404).json({ message: "Tuition not found" });
+      }
+
+      // ---------- 5) write the decision ----------
+      // Only this one field changes — the rest of the post is
+      // untouched, and the admin can flip the decision later.
+      await db
+        .collection("tuitions")
+        .updateOne({ _id: new ObjectId(id) }, { $set: { approvalStatus } });
+
+      // ---------- 6) answer with the new status ----------
+      return res.json({
+        message: `Tuition ${approvalStatus}`, // "Tuition approved" / "Tuition rejected"
+        tuition: {
+          id: String(tuition._id),
+          approvalStatus, // the NEW status
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    // ---------- 2) validate the id format ----------
-    const { id } = req.params;
-    if (!/^[0-9a-fA-F]{24}$/.test(id)) {
-      return res.status(404).json({ message: "Tuition not found" });
-    }
-
-    // ---------- 3) validate the new status ----------
-    // Only the two decisions from the requirement are allowed
-    // (setting it back to "pending" is not part of the flow).
-    const { approvalStatus } = req.body || {};
-    if (approvalStatus !== "approved" && approvalStatus !== "rejected") {
-      return res
-        .status(400)
-        .json({ message: "approvalStatus must be approved or rejected" });
-    }
-
-    // ---------- 4) the post must exist ----------
-    const tuition = await db
-      .collection("tuitions")
-      .findOne({ _id: new ObjectId(id) });
-    if (!tuition) {
-      return res.status(404).json({ message: "Tuition not found" });
-    }
-
-    // ---------- 5) write the decision ----------
-    // Only this one field changes — the rest of the post is
-    // untouched, and the admin can flip the decision later.
-    await db
-      .collection("tuitions")
-      .updateOne({ _id: new ObjectId(id) }, { $set: { approvalStatus } });
-
-    // ---------- 6) answer with the new status ----------
-    return res.json({
-      message: `Tuition ${approvalStatus}`, // "Tuition approved" / "Tuition rejected"
-      tuition: {
-        id: String(tuition._id),
-        approvalStatus, // the NEW status
-      },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // GET /api/admin/transactions — EVERY Stripe payment row from
@@ -1573,72 +1649,77 @@ app.patch("/api/admin/tuitions/:id", verifyToken, async (req, res) => {
 // role back (the email is also saved on the payment itself, so
 // deleted accounts still show something sensible).
 // ============================================================
-app.get("/api/admin/transactions", verifyToken, async (req, res) => {
-  try {
-    // ---------- 1) only admins may see the money ----------
-    if (req.user.role !== "admin") {
-      return res
-        .status(403)
-        .json({ message: "Only admins can view transactions" });
+app.get(
+  "/api/admin/transactions",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      // ---------- 1) only admins may see the money ----------
+      if (req.user.role !== "admin") {
+        return res
+          .status(403)
+          .json({ message: "Only admins can view transactions" });
+      }
+
+      // ---------- 2) every payment row, newest first ----------
+      const list = await db
+        .collection("payments")
+        .find({})
+        .sort({ createdAt: -1 }) // latest transactions at the top
+        .toArray();
+
+      // ---------- 3) join the buyers (ONE query) ----------
+      // userId is a plain string id — collect the unique ones,
+      // keep only valid 24-hex ids, then fetch them in one go.
+      // (same trick as the admin tuitions endpoint above)
+      const buyerIds = [...new Set(list.map((p) => String(p.userId)))].filter(
+        (id) => /^[0-9a-fA-F]{24}$/.test(id),
+      ); // safety first
+      const buyers =
+        buyerIds.length > 0
+          ? await db
+              .collection("users")
+              .find({ _id: { $in: buyerIds.map((id) => new ObjectId(id)) } })
+              .toArray()
+          : [];
+      const buyerById = new Map(buyers.map((u) => [String(u._id), u]));
+
+      // ---------- 4) merge into flat rows for the table ----------
+      const transactions = list.map((p) => {
+        const buyer = buyerById.get(String(p.userId)); // may be undefined
+
+        // "student" / "tutor" -> "Pro Student Plan" / "Pro Tutor Plan"
+        const planName =
+          p.product === "tutor"
+            ? "Pro Tutor Plan"
+            : p.product === "student"
+              ? "Pro Student Plan"
+              : p.planName || "Pro Plan"; // older/odd docs
+
+        return {
+          id: String(p._id), // row key for React
+          userName: buyer?.name || "(deleted user)", // joined from users
+          userEmail: buyer?.email || p.userEmail || "(unknown email)",
+          role: buyer?.role || "unknown", // student | tutor | admin
+          planName, // what was bought
+          amount: typeof p.amount === "number" ? p.amount : 0, // whole dollars
+          currency: p.currency || "usd",
+          // Stripe's payment id = the transaction id on the page
+          // (falls back to the checkout session id for old rows)
+          transactionId: p.stripePaymentIntentId || p.stripeSessionId || "",
+          paymentDate: p.createdAt || null, // ISO date of the payment
+          status: p.status || "paid", // paid | ...
+        };
+      });
+
+      return res.json({ transactions });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Something went wrong on the server" });
     }
-
-    // ---------- 2) every payment row, newest first ----------
-    const list = await db
-      .collection("payments")
-      .find({})
-      .sort({ createdAt: -1 }) // latest transactions at the top
-      .toArray();
-
-    // ---------- 3) join the buyers (ONE query) ----------
-    // userId is a plain string id — collect the unique ones,
-    // keep only valid 24-hex ids, then fetch them in one go.
-    // (same trick as the admin tuitions endpoint above)
-    const buyerIds = [...new Set(list.map((p) => String(p.userId)))].filter(
-      (id) => /^[0-9a-fA-F]{24}$/.test(id),
-    ); // safety first
-    const buyers =
-      buyerIds.length > 0
-        ? await db
-            .collection("users")
-            .find({ _id: { $in: buyerIds.map((id) => new ObjectId(id)) } })
-            .toArray()
-        : [];
-    const buyerById = new Map(buyers.map((u) => [String(u._id), u]));
-
-    // ---------- 4) merge into flat rows for the table ----------
-    const transactions = list.map((p) => {
-      const buyer = buyerById.get(String(p.userId)); // may be undefined
-
-      // "student" / "tutor" -> "Pro Student Plan" / "Pro Tutor Plan"
-      const planName =
-        p.product === "tutor"
-          ? "Pro Tutor Plan"
-          : p.product === "student"
-            ? "Pro Student Plan"
-            : p.planName || "Pro Plan"; // older/odd docs
-
-      return {
-        id: String(p._id), // row key for React
-        userName: buyer?.name || "(deleted user)", // joined from users
-        userEmail: buyer?.email || p.userEmail || "(unknown email)",
-        role: buyer?.role || "unknown", // student | tutor | admin
-        planName, // what was bought
-        amount: typeof p.amount === "number" ? p.amount : 0, // whole dollars
-        currency: p.currency || "usd",
-        // Stripe's payment id = the transaction id on the page
-        // (falls back to the checkout session id for old rows)
-        transactionId: p.stripePaymentIntentId || p.stripeSessionId || "",
-        paymentDate: p.createdAt || null, // ISO date of the payment
-        status: p.status || "paid", // paid | ...
-      };
-    });
-
-    return res.json({ transactions });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Something went wrong on the server" });
-  }
-});
+  },
+);
 
 // ============================================================
 // POST /api/payments/verify — CHECKOUT VERIFICATION

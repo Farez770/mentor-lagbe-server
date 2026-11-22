@@ -9,24 +9,40 @@ const app = express();
 const port = process.env.PORT || 5000;
 app.use(express.json());
 app.use(cors());
-const client = new MongoClient(process.env.MONGODB_URI);
+
+if (!process.env.MONGODB_URI) {
+  console.error(
+    "MONGODB_URI is missing. Add it in Vercel > Settings > Environment Variables.",
+  );
+}
+
+const client = process.env.MONGODB_URI
+  ? new MongoClient(process.env.MONGODB_URI)
+  : null;
+
 export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.dir(err);
+  if (!client) {
+    throw new Error("MONGODB_URI is missing");
   }
+  await client.connect();
+  console.log("Connected to MongoDB");
+  return client;
 }
 
 const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("mentor-lagbe");
 
-const CLIENT_URL = (process.env.CLIENT_URL || "http://localhost:3000").replace(
-  /\/$/,
-  "",
-);
+const CLIENT_URL = (
+  process.env.BETTER_AUTH_URL ||
+  process.env.CLIENT_URL ||
+  "http://localhost:3000"
+).replace(/\/$/, "");
+
+if (CLIENT_URL === "http://localhost:3000" && process.env.VERCEL) {
+  console.error(
+    "BETTER_AUTH_URL is missing. Set it to your deployed FRONTEND URL.",
+  );
+}
 
 const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
 
@@ -1620,6 +1636,10 @@ app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });
 });
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Backend listening on port ${port}`);
+  });
+}
+
+export default app;

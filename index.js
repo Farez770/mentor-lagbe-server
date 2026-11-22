@@ -317,6 +317,33 @@ app.get("/api/tuitions/mine", verifyToken, verifyTutor, async (req, res) => {
 });
 
 // ============================================================
+// CHALLENGE 1: SERVER-SIDE SEARCH + FILTER
+//
+// The Browse Tuitions page now sends its filters as URL query
+// params, e.g. /api/tuitions?q=physics&subject=Physics&mode=Online
+//
+// Supported params:
+//   q           -> searches title / subject / tutorName / classLevel
+//   subject     -> exact subject match (case-insensitive)
+//   classLevel  -> exact class match (case-insensitive)
+//   mode        -> exact Online/Offline match (case-insensitive)
+//
+// "all" and empty values mean "do not filter". The public rule is
+// unchanged: only approved + active tuitions are ever returned.
+// ============================================================
+
+// Escape characters that have a special meaning inside a regex so
+// a user typing "C++" or "Math (HSC)" cannot break the query.
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Build a safe "exact value, ignoring case" MongoDB condition.
+function exactIgnoreCase(value) {
+  return { $regex: `^${escapeRegex(value)}$`, $options: "i" };
+}
+
+// ============================================================
 // GET /api/tuitions — PUBLIC list for the Browse Tuitions page
 // (no login needed — anyone can browse)
 //
@@ -329,14 +356,54 @@ app.get("/api/tuitions/mine", verifyToken, verifyTutor, async (req, res) => {
 // ============================================================
 app.get("/api/tuitions", async (req, res) => {
   try {
-    const list = await db
-      .collection("tuitions")
-      .find({
-        approvalStatus: "approved", // admin must have approved it
-        isActive: true, // and the listing must still be live
-      })
-      .sort({ createdAt: -1 }) // newest first (featured takes 6)
-      .toArray();
+    // --- 1) Read the filters sent by the client ---
+    // `search` is accepted as an alias for `q` so older links still work.
+    const q = String(req.query.q ?? req.query.search ?? "").trim();
+    const subject = String(req.query.subject ?? "all").trim();
+    const classLevel = String(req.query.classLevel ?? "all").trim();
+    const mode = String(req.query.mode ?? "all").trim();
+
+    // This filter NEVER changes — admins/tutors cannot accidentally
+    // expose pending, rejected or closed posts through search params.
+    const publicFilter = { approvalStatus: "approved", isActive: true };
+
+    // --- 2) Start from the public filter, then add optional filters ---
+    const filter = { ...publicFilter };
+
+    if (q) {
+      const safeQ = escapeRegex(q);
+      filter.$or = [
+        { title: { $regex: safeQ, $options: "i" } },
+        { subject: { $regex: safeQ, $options: "i" } },
+        { tutorName: { $regex: safeQ, $options: "i" } },
+        { classLevel: { $regex: safeQ, $options: "i" } },
+      ];
+    }
+    if (subject && subject.toLowerCase() !== "all") {
+      filter.subject = exactIgnoreCase(subject);
+    }
+    if (classLevel && classLevel.toLowerCase() !== "all") {
+      filter.classLevel = exactIgnoreCase(classLevel);
+    }
+    if (mode && mode.toLowerCase() !== "all") {
+      filter.mode = exactIgnoreCase(mode);
+    }
+
+    // --- 3) Run the filtered list + facet/count queries together ---
+    // Facets come from the UNFILTERED public list so the dropdowns do
+    // not shrink after the user picks one option.
+    const [list, totalAvailable, subjects, classLevels, modes] =
+      await Promise.all([
+        db
+          .collection("tuitions")
+          .find(filter)
+          .sort({ createdAt: -1 }) // newest first (featured takes 6)
+          .toArray(),
+        db.collection("tuitions").countDocuments(publicFilter),
+        db.collection("tuitions").distinct("subject", publicFilter),
+        db.collection("tuitions").distinct("classLevel", publicFilter),
+        db.collection("tuitions").distinct("mode", publicFilter),
+      ]);
 
     // turn MongoDB's _id into a normal "id" field
     const tuitions = list.map((doc) => {
@@ -344,7 +411,19 @@ app.get("/api/tuitions", async (req, res) => {
       return { id: String(_id), ...rest };
     });
 
-    return res.json({ tuitions });
+    const asStrings = (values) =>
+      values.map(String).sort((a, b) => a.localeCompare(b));
+
+    return res.json({
+      tuitions,
+      total: tuitions.length, // how many matched THIS search/filter
+      totalAvailable, // how many public tuitions exist in total
+      facets: {
+        subjects: asStrings(subjects),
+        classLevels: asStrings(classLevels),
+        modes: asStrings(modes),
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });

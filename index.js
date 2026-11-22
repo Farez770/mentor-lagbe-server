@@ -340,7 +340,6 @@ app.get("/api/tuitions/mine", verifyToken, verifyTutor, async (req, res) => {
   }
 });
 
-
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -625,7 +624,6 @@ app.delete("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
     res.status(500).json({ message: "Something went wrong on the server" });
   }
 });
-
 
 app.post("/api/applications", verifyToken, verifyStudent, async (req, res) => {
   try {
@@ -986,7 +984,6 @@ app.delete(
     }
   },
 );
-
 
 const FREE_BOOKMARK_LIMIT = 5;
 
@@ -1626,3 +1623,5 @@ app.use((req, res) => {
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
+
+export default app;

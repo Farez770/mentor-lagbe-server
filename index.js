@@ -11,7 +11,6 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const port = process.env.PORT || 5000;
-
 app.use(express.json());
 app.use(cors());
 const client = new MongoClient(process.env.MONGODB_URI);
@@ -48,6 +47,115 @@ const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
+
+// ============================================================
+// POST /api/webhooks/stripe — REAL STRIPE WEBHOOK
+//
+// The /api/payments/verify route covers the normal success-page
+// flow. This webhook covers the case where the visitor closes the
+// success page before it loads. Stripe sends the raw signed body,
+// so this route MUST be registered before express.json().
+//
+// Configure in Stripe Dashboard:
+//   endpoint: https://<your-domain>/api/webhooks/stripe
+//   event:    checkout.session.completed
+//   secret:   STRIPE_WEBHOOK_SECRET in backend .env
+// ============================================================
+app.post(
+  "/api/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!stripe || !webhookSecret) {
+      return res.status(503).json({
+        message: "Stripe webhook is not configured (missing env vars)",
+      });
+    }
+    if (!signature || typeof signature !== "string") {
+      return res.status(400).json({ message: "Missing Stripe signature" });
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret,
+      );
+    } catch (err) {
+      console.error(
+        "Stripe webhook signature verification failed:",
+        err?.message ?? err,
+      );
+      return res.status(400).json({ message: "Invalid Stripe signature" });
+    }
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      if (session.payment_status === "paid") {
+        const product = session.metadata?.plan; // "tutor" | "student"
+        const userId = session.metadata?.userId; // set server-side at checkout
+
+        if (
+          (product === "tutor" || product === "student") &&
+          typeof userId === "string" &&
+          /^[0-9a-fA-F]{24}$/.test(userId)
+        ) {
+          const user = await db
+            .collection("users")
+            .findOne(
+              { _id: new ObjectId(userId) },
+              { projection: { name: 1, email: 1 } },
+            );
+
+          if (user) {
+            // Same idempotent upsert as /api/payments/verify, so a
+            // webhook + success page cannot double-count revenue.
+            await db.collection("payments").updateOne(
+              { stripeSessionId: session.id },
+              {
+                $setOnInsert: {
+                  stripeSessionId: session.id,
+                  stripePaymentIntentId:
+                    typeof session.payment_intent === "string"
+                      ? session.payment_intent
+                      : null,
+                  userId,
+                  userEmail: user.email,
+                  userName: user.name,
+                  plan: "pro",
+                  product,
+                  amount: (session.amount_total ?? 0) / 100,
+                  amountCents: session.amount_total ?? 0,
+                  currency: session.currency ?? "usd",
+                  status: "paid",
+                  createdAt: new Date(),
+                },
+              },
+              { upsert: true },
+            );
+
+            await db
+              .collection("users")
+              .updateOne(
+                { _id: new ObjectId(userId) },
+                { $set: { plan: "pro" } },
+              );
+          }
+        }
+      }
+    }
+
+    // Always tell Stripe "received" so it stops retrying.
+    return res.json({ received: true });
+  },
+);
+
+// Normal JSON parsing for every other API route.
+app.use(express.json());
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
@@ -438,9 +546,8 @@ app.get("/api/tuitions", async (req, res) => {
 //   approved   = approved + live (admin approves in Phase 5)
 //   pending    = waiting for admin approval
 //   applicants = REAL count of applications received
-//                (FIXED 2026-11-21: this used to be a
-//                hardcoded 0 with a TODO — it now counts the
-//                "applications" collection for this tutor)
+//                (counted from the "applications" collection
+//                for this tutor)
 // ============================================================
 app.get("/api/tuitions/stats", verifyToken, verifyTutor, async (req, res) => {
   try {
@@ -502,16 +609,32 @@ app.get("/api/tuitions/:id", async (req, res) => {
       .collection("tuitions")
       .findOne({ _id: new ObjectId(id), isActive: true });
 
-    // TODO (pro features): join the tutor's plan (users.plan)
-    // here so the details page can show the Pro "verified badge"
-
     if (!doc) {
       return res.status(404).json({ message: "Tuition not found" });
     }
 
+    // Join the tutor's plan from users.plan so the details page can
+    // show the Pro "verified badge". This stays inside the existing
+    // 4-collection design — no extra collection is introduced.
+    let tutorPlan = "free";
+    const postedBy = String(doc.postedBy ?? "");
+    if (/^[0-9a-fA-F]{24}$/.test(postedBy)) {
+      const tutor = await db
+        .collection("users")
+        .findOne({ _id: new ObjectId(postedBy) }, { projection: { plan: 1 } });
+      tutorPlan = tutor?.plan === "pro" ? "pro" : "free";
+    }
+
     // turn MongoDB's _id into a normal "id" field
     const { _id, ...rest } = doc;
-    return res.json({ tuition: { id: String(_id), ...rest } });
+    return res.json({
+      tuition: {
+        id: String(_id),
+        ...rest,
+        tutorPlan,
+        tutorVerified: tutorPlan === "pro",
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });
@@ -1824,9 +1947,10 @@ app.get(
 //   plan: 'pro' in the users collection."
 //
 // We use CHECKOUT VERIFICATION because it works locally without
-// the Stripe CLI / a public URL (a webhook TODO is noted at the
-// bottom of this route). The /payment/success page calls this
-// with the session id Stripe appended to the redirect URL.
+// the Stripe CLI / a public URL. A real signed webhook is also
+// registered near the top of this file for production. The
+// /payment/success page calls this route with the session id
+// Stripe appended to the redirect URL.
 //
 // The browser only ever sends the session id — the server asks
 // STRIPE itself whether the money arrived, so nobody can claim
@@ -1941,10 +2065,9 @@ app.post("/api/payments/verify", verifyToken, async (req, res) => {
       },
     });
 
-    // TODO (hardening): add a real Stripe webhook
-    // (checkout.session.completed with signature verification via
-    // STRIPE_WEBHOOK_SECRET) so payments are recorded even when
-    // the visitor closes the success page before it loads.
+    // The signed /api/webhooks/stripe route above also records this
+    // payment if the visitor closes the success page before it loads.
+    // Both paths use the same idempotent payments upsert.
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Something went wrong on the server" });
